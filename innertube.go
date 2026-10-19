@@ -9,17 +9,29 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 )
 
-const innertubeURL = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+// Defaults are variables so tests can point them at an httptest server.
+var (
+	innertubeURL = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+	watchPageURL = "https://www.youtube.com/watch?v="
+)
 
-var httpClient = &http.Client{Timeout: 20 * time.Second}
+const (
+	// Per-attempt HTTP timeout. A full cascade is bounded by the caller's
+	// total deadline, not by this.
+	perAttemptTimeout = 10 * time.Second
+	maxAttempts       = 2
+	maxBackoff        = 2 * time.Second
+)
+
+var httpClient = &http.Client{Timeout: perAttemptTimeout}
 
 type clientContext struct {
 	Name       string // Innertube clientName
@@ -59,6 +71,11 @@ type captionTrack struct {
 	} `json:"name"`
 }
 
+type audioTrack struct {
+	AudioTrackID        string `json:"audioTrackId"`
+	CaptionTrackIndices []int  `json:"captionTrackIndices"`
+}
+
 func (t captionTrack) trackName() string {
 	if t.Name.SimpleText != "" {
 		return t.Name.SimpleText
@@ -83,12 +100,24 @@ type playerResponse struct {
 		LengthSeconds    string `json:"lengthSeconds"`
 		ViewCount        string `json:"viewCount"`
 		ShortDescription string `json:"shortDescription"`
+		IsLiveContent    bool   `json:"isLiveContent"`
 	} `json:"videoDetails"`
 	Captions struct {
 		Renderer struct {
-			CaptionTracks []captionTrack `json:"captionTracks"`
+			CaptionTracks          []captionTrack `json:"captionTracks"`
+			AudioTracks            []audioTrack   `json:"audioTracks"`
+			DefaultAudioTrackIndex int            `json:"defaultAudioTrackIndex"`
 		} `json:"playerCaptionsTracklistRenderer"`
 	} `json:"captions"`
+	// May be absent in ANDROID/IOS responses; treated as optional metadata.
+	Microformat struct {
+		Renderer struct {
+			PublishDate string   `json:"publishDate"`
+			UploadDate  string   `json:"uploadDate"`
+			Category    string   `json:"category"`
+			Keywords    []string `json:"keywords,omitempty"`
+		} `json:"playerMicroformatRenderer"`
+	} `json:"microformat"`
 }
 
 func (p *playerResponse) tracks() []captionTrack {
@@ -99,9 +128,110 @@ func (p *playerResponse) playable() bool {
 	return p.PlayabilityStatus.Status == "OK"
 }
 
+func (p *playerResponse) isLive() bool {
+	return p.VideoDetails.IsLiveContent
+}
+
+func (p *playerResponse) durationSeconds() int {
+	n := 0
+	for _, c := range strings.TrimSpace(p.VideoDetails.LengthSeconds) {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+// ---- HTTP with bounded retries ----
+
+func backoff(attempt int) time.Duration {
+	d := 250 * time.Millisecond
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if d > maxBackoff {
+			return maxBackoff
+		}
+	}
+	return d
+}
+
+// requestWithRetry issues one logical request, retrying only on 429/5xx and
+// network errors. It returns the response for any other status so callers can
+// classify it (404 means something different than 403).
+func requestWithRetry(ctx context.Context, method, url string, body []byte, headers map[string]string) (*http.Response, error) {
+	var last error
+	sleptForRetryAfter := false
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 && !sleptForRetryAfter {
+			select {
+			case <-ctx.Done():
+				return nil, classifyContext(ctx.Err())
+			case <-time.After(backoff(attempt)):
+			}
+		}
+		sleptForRetryAfter = false
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, rdr)
+		if err != nil {
+			return nil, newToolError(CodeBadRequest, "could not build request: %v", err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if ce := classifyContext(ctx.Err()); ce != nil {
+				return nil, ce
+			}
+			last = newToolError(CodeNetwork, "network error: %v", err)
+			last.(*ToolError).Retryable = true
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			te := classifyHTTPStatus(resp.StatusCode, resp.Header.Get("Retry-After"))
+			resp.Body.Close()
+			last = te
+			if attempt == maxAttempts-1 {
+				return nil, te
+			}
+			if te.RetryAfterSeconds > 0 {
+				wait := time.Duration(te.RetryAfterSeconds) * time.Second
+				if wait > maxBackoff*5 {
+					wait = maxBackoff * 5
+				}
+				select {
+				case <-ctx.Done():
+					return nil, classifyContext(ctx.Err())
+				case <-time.After(wait):
+				}
+				sleptForRetryAfter = true
+			}
+			continue
+		}
+		return resp, nil
+	}
+	if last == nil {
+		last = newToolError(CodeNetwork, "request failed")
+	}
+	return nil, last
+}
+
+func readBody(resp *http.Response, limit int64) ([]byte, error) {
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		te := classifyHTTPStatus(resp.StatusCode, resp.Header.Get("Retry-After"))
+		return nil, te
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, limit))
+}
+
 // ---- fetchers ----
 
-func innertubePlayer(videoID string, c clientContext) (*playerResponse, error) {
+func clientContextBody(c clientContext) map[string]any {
 	client := map[string]any{
 		"clientName":    c.Name,
 		"clientVersion": c.Version,
@@ -114,35 +244,34 @@ func innertubePlayer(videoID string, c clientContext) (*playerResponse, error) {
 		client["deviceMake"] = "Apple"
 		client["deviceModel"] = c.IOSModel
 	}
+	return client
+}
+
+func innertubePlayer(ctx context.Context, videoID string, c clientContext) (*playerResponse, error) {
 	body, err := json.Marshal(map[string]any{
-		"context": map[string]any{"client": client},
+		"context": map[string]any{"client": clientContextBody(c)},
 		"videoId": videoID,
+	})
+	if err != nil {
+		return nil, newToolError(CodeInternal, "could not encode request: %v", err)
+	}
+	resp, err := requestWithRetry(ctx, http.MethodPost, innertubeURL, body, map[string]string{
+		"Content-Type": "application/json",
+		"User-Agent":   c.UA,
 	})
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, innertubeURL, bytes.NewReader(body))
+	raw, err := readBody(resp, 16<<20)
 	if err != nil {
 		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", c.UA)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("innertube %s: HTTP %d", c.Name, resp.StatusCode)
 	}
 	var pr playerResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&pr); err != nil {
-		return nil, fmt.Errorf("innertube %s: %w", c.Name, err)
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return nil, newToolError(CodeUpstreamChanged, "innertube %s returned unparsable JSON: %v", c.Name, err)
 	}
 	if !pr.playable() {
-		return nil, fmt.Errorf("innertube %s: %s: %s",
-			c.Name, pr.PlayabilityStatus.Status, pr.PlayabilityStatus.Reason)
+		return nil, classifyPlayability(pr.PlayabilityStatus.Status, pr.PlayabilityStatus.Reason)
 	}
 	return &pr, nil
 }
@@ -150,38 +279,28 @@ func innertubePlayer(videoID string, c clientContext) (*playerResponse, error) {
 // watchPagePlayer scrapes ytInitialPlayerResponse out of the HTML watch page.
 // Kept as last resort: its caption URLs are pot-gated since mid-2025, but the
 // track list itself is still useful when the youtubei POST endpoint is blocked.
-func watchPagePlayer(videoID string) (*playerResponse, error) {
-	u := "https://www.youtube.com/watch?v=" + videoID
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+func watchPagePlayer(ctx context.Context, videoID string) (*playerResponse, error) {
+	resp, err := requestWithRetry(ctx, http.MethodGet, watchPageURL+videoID, nil, map[string]string{
+		"User-Agent":      browserUA,
+		"Accept-Language": "en-US,en;q=0.9",
+	})
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("watch page: HTTP %d", resp.StatusCode)
-	}
-	page, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	page, err := readBody(resp, 32<<20)
 	if err != nil {
 		return nil, err
 	}
 	raw := extractInitialPlayerResponse(string(page))
 	if raw == "" {
-		return nil, fmt.Errorf("watch page: ytInitialPlayerResponse not found")
+		return nil, newToolError(CodeUpstreamChanged, "watch page did not contain ytInitialPlayerResponse")
 	}
 	var pr playerResponse
 	if err := json.Unmarshal([]byte(raw), &pr); err != nil {
-		return nil, fmt.Errorf("watch page: %w", err)
+		return nil, newToolError(CodeUpstreamChanged, "watch page player response was unparsable: %v", err)
 	}
 	if !pr.playable() {
-		return nil, fmt.Errorf("watch page: %s: %s",
-			pr.PlayabilityStatus.Status, pr.PlayabilityStatus.Reason)
+		return nil, classifyPlayability(pr.PlayabilityStatus.Status, pr.PlayabilityStatus.Reason)
 	}
 	return &pr, nil
 }
@@ -221,23 +340,59 @@ func extractInitialPlayerResponse(page string) string {
 	return ""
 }
 
-// getPlayerResponse returns the first working player response and which
-// method produced it ("innertube-android", "innertube-ios", "watch-page").
-func getPlayerResponse(videoID string) (*playerResponse, string, error) {
-	var errs []string
+// fetchPlayer cascades acquisition methods. A response whose caption track list
+// is empty is only used as a fallback: an OK response with zero tracks from one
+// client must not short-circuit clients that do have tracks.
+func fetchPlayer(ctx context.Context, videoID string) (*playerResponse, string, error) {
+	var errs []error
+	var fallback *playerResponse
+	var fallbackVia string
+
 	for _, c := range clientContexts {
-		pr, err := innertubePlayer(videoID, c)
+		pr, err := innertubePlayer(ctx, videoID, c)
 		if err != nil {
-			errs = append(errs, err.Error())
+			if te, ok := toolErrorOf(err); ok {
+				switch te.Code {
+				case CodePrivate, CodeAgeRestricted, CodeBotCheck, CodeNotFound:
+					return nil, "", te
+				}
+			}
+			errs = append(errs, err)
 			continue
 		}
-		return pr, "innertube-" + strings.ToLower(c.Name), nil
+		via := "innertube-" + strings.ToLower(c.Name)
+		if len(pr.tracks()) > 0 {
+			return pr, via, nil
+		}
+		if fallback == nil {
+			fallback, fallbackVia = pr, via
+		}
 	}
-	pr, err := watchPagePlayer(videoID)
+
+	pr, err := watchPagePlayer(ctx, videoID)
 	if err != nil {
-		errs = append(errs, err.Error())
-	} else {
+		if te, ok := toolErrorOf(err); ok {
+			switch te.Code {
+			case CodePrivate, CodeAgeRestricted, CodeBotCheck, CodeNotFound:
+				return nil, "", te
+			}
+		}
+		errs = append(errs, err)
+	} else if len(pr.tracks()) > 0 {
 		return pr, "watch-page", nil
+	} else if fallback == nil {
+		fallback, fallbackVia = pr, "watch-page"
 	}
-	return nil, "", fmt.Errorf("all methods failed: %s", strings.Join(errs, " | "))
+
+	if fallback != nil {
+		return fallback, fallbackVia, nil
+	}
+	return nil, "", aggregateToolErrors(errs)
+}
+
+func describeVia(via string) string {
+	if via == "" {
+		return "unknown"
+	}
+	return via
 }
