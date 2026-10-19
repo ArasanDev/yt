@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "yt": {
+      "command": "yt",
+      "args": ["mcp"],
+      "transport": "stdio"
+    }
+  }
+}
