@@ -3,7 +3,7 @@
 // The point is to stop the three-tools-three-player-fetches pattern, not to be
 // a general-purpose cache: entries are byte-bounded and evicted oldest-expiry
 // first.
-package main
+package youtube
 
 import (
 	"sync"

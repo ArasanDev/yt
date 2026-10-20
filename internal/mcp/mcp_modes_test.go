@@ -1,42 +1,25 @@
-package main
+package mcp
 
 import (
 	"context"
 	"testing"
+
+	"yt/internal/render"
+	"yt/internal/search"
 )
 
-func TestInfoParsesChaptersPastDescriptionCutoff(t *testing.T) {
+func TestMCPTimestampWindowMatchesGranularity(t *testing.T) {
 	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
-	f.description = "Blurb.\n\nChapters:\n00:00 Opening\n00:10 Middle\n00:20 End\n\nLinks:\nhttps://example.com\n"
-
-	info, err := NewClient().Info(context.Background(), "testvideo01", 6)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(info.Chapters) != 3 {
-		t.Fatalf("want 3 chapters even when the description is truncated, got %+v", info.Chapters)
-	}
-	if info.Chapters[1].StartSeconds != 10 || info.Chapters[1].Title != "Middle" {
-		t.Errorf("chapter 1 = %+v", info.Chapters[1])
-	}
-	if !info.DescriptionTruncated {
-		t.Error("description should still be truncated for the payload")
-	}
-}
-
-func TestMCPTimestampWindowMatchesGranularity(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
-	defer cleanup()
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(f.client)
 
 	block, _, err := s.getTranscript(context.Background(), nil, transcriptIn{URLOrID: "testvideo01", Granularity: "block"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	bout := block.StructuredContent.(transcriptOut)
-	if bout.TimestampWindowSeconds != int(blockSeconds) {
-		t.Errorf("block window = %d, want %d", bout.TimestampWindowSeconds, int(blockSeconds))
+	if bout.TimestampWindowSeconds != int(render.BlockSeconds) {
+		t.Errorf("block window = %d, want %d", bout.TimestampWindowSeconds, int(render.BlockSeconds))
 	}
 
 	cue, _, err := s.getTranscript(context.Background(), nil, transcriptIn{URLOrID: "testvideo01", Granularity: "cue", TimestampMode: "cue"})
@@ -50,9 +33,9 @@ func TestMCPTimestampWindowMatchesGranularity(t *testing.T) {
 }
 
 func TestMCPJSONTimestampWindowIsZero(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(f.client)
 
 	res, _, err := s.getTranscript(context.Background(), nil, transcriptIn{URLOrID: "testvideo01", Format: "json"})
 	if err != nil {
@@ -68,9 +51,9 @@ func TestMCPJSONTimestampWindowIsZero(t *testing.T) {
 }
 
 func TestMCPSearchRejectsUnknownMatchMode(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(f.client)
 
 	res, _, err := s.searchTranscript(context.Background(), nil, searchIn{
 		URLOrID:   "testvideo01",
@@ -86,9 +69,9 @@ func TestMCPSearchRejectsUnknownMatchMode(t *testing.T) {
 }
 
 func TestMCPSearchPassesMatchMode(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(f.client)
 
 	res, _, err := s.searchTranscript(context.Background(), nil, searchIn{
 		URLOrID:   "testvideo01",
@@ -102,7 +85,7 @@ func TestMCPSearchPassesMatchMode(t *testing.T) {
 	if !ok {
 		t.Fatalf("want searchOut, got %T", res.StructuredContent)
 	}
-	if out.MatchMode != string(MatchPhrase) {
+	if out.MatchMode != string(search.Phrase) {
 		t.Errorf("match_mode = %q, want phrase", out.MatchMode)
 	}
 	if out.TotalMatches != 1 {

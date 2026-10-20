@@ -1,4 +1,4 @@
-package main
+package mcp
 
 import (
 	"context"
@@ -6,16 +6,19 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"yt/internal/apperr"
+	"yt/internal/transcript"
 )
 
 // The JSON branch used to report block-rendered metadata (truncated=false,
 // returned_chars including the header) while emitting an unbounded cue list.
 func TestMCPJSONMetaMatchesPayload(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(f.client)
 	maxChars := 60
 	res, _, err := s.getTranscript(context.Background(), nil, transcriptIn{
 		URLOrID: "testvideo01", Format: "json", MaxChars: &maxChars,
@@ -27,10 +30,10 @@ func TestMCPJSONMetaMatchesPayload(t *testing.T) {
 		t.Fatalf("unexpected tool error: %v", res.Content)
 	}
 	var doc struct {
-		Meta     transcriptMeta `json:"meta"`
-		Segments []Segment      `json:"segments"`
+		Meta     transcriptMeta       `json:"meta"`
+		Segments []transcript.Segment `json:"segments"`
 	}
-	raw := res.Content[0].(*mcp.TextContent).Text
+	raw := res.Content[0].(*mcpsdk.TextContent).Text
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
 		t.Fatalf("payload is not valid JSON: %v", err)
 	}
@@ -52,10 +55,10 @@ func TestMCPJSONMetaMatchesPayload(t *testing.T) {
 }
 
 func TestMCPMaxCuesReportsContinuation(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(f.client)
 	res, _, err := s.getTranscript(context.Background(), nil, transcriptIn{
 		URLOrID: "testvideo01", Granularity: "cue", TimestampMode: "cue", MaxCues: 3,
 	})
@@ -76,34 +79,34 @@ func TestMCPMaxCuesReportsContinuation(t *testing.T) {
 }
 
 func TestMCPRejectsUnknownFormat(t *testing.T) {
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(nil)
 	res, _, err := s.getTranscript(context.Background(), nil, transcriptIn{
 		URLOrID: "testvideo01", Format: "xml",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertToolError(t, res, CodeBadRequest)
+	assertToolError(t, res, apperr.CodeBadRequest)
 }
 
 func TestMCPRejectsInvertedRange(t *testing.T) {
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(nil)
 	res, _, err := s.getTranscript(context.Background(), nil, transcriptIn{
 		URLOrID: "testvideo01", StartSeconds: 30, EndSeconds: 10,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertToolError(t, res, CodeBadRequest)
+	assertToolError(t, res, apperr.CodeBadRequest)
 }
 
 // SDK input validation runs before handlers, so its IsError results used to
 // arrive with no structured payload. The middleware must add a code.
 func TestSchemaValidationErrorsAreStructured(t *testing.T) {
-	next := func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-		return &mcp.CallToolResult{
+	next := func(ctx context.Context, method string, req mcpsdk.Request) (mcpsdk.Result, error) {
+		return &mcpsdk.CallToolResult{
 			IsError: true,
-			Content: []mcp.Content{&mcp.TextContent{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{
 				Text: `unexpected additional property "maxchars"`,
 			}},
 		}, nil
@@ -113,7 +116,7 @@ func TestSchemaValidationErrorsAreStructured(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cr, ok := res.(*mcp.CallToolResult)
+	cr, ok := res.(*mcpsdk.CallToolResult)
 	if !ok {
 		t.Fatalf("want CallToolResult, got %T", res)
 	}
@@ -121,8 +124,8 @@ func TestSchemaValidationErrorsAreStructured(t *testing.T) {
 	if !ok {
 		t.Fatalf("schema error lost its structure: %#v", cr.StructuredContent)
 	}
-	te, ok := payload["error"].(*ToolError)
-	if !ok || te.Code != CodeBadRequest {
+	te, ok := payload["error"].(*apperr.Error)
+	if !ok || te.Code != apperr.CodeBadRequest {
 		t.Fatalf("want bad_request, got %#v", payload["error"])
 	}
 	if !strings.Contains(te.Message, "maxchars") {
@@ -134,10 +137,10 @@ func TestSchemaValidationErrorsAreStructured(t *testing.T) {
 // Regression: get_transcript reported returned_chars > 0 while shipping the
 // text only in content[0].text, so such clients summarized nothing.
 func TestMCPTranscriptBodyIsInStructuredContent(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	s := &MCPServer{client: NewClient()}
+	s := NewServer(f.client)
 
 	// Text format: the rendered body must be present in structured content.
 	res, _, err := s.getTranscript(context.Background(), nil, transcriptIn{URLOrID: "testvideo01"})
@@ -154,7 +157,7 @@ func TestMCPTranscriptBodyIsInStructuredContent(t *testing.T) {
 	if strings.TrimSpace(out.Text) == "" {
 		t.Fatal("structuredContent.text is empty: structured-only clients receive no transcript")
 	}
-	if block := res.Content[0].(*mcp.TextContent).Text; block != out.Text {
+	if block := res.Content[0].(*mcpsdk.TextContent).Text; block != out.Text {
 		t.Error("content block and structuredContent.text disagree")
 	}
 
@@ -175,7 +178,7 @@ func TestMCPTranscriptBodyIsInStructuredContent(t *testing.T) {
 	}
 }
 
-func assertToolError(t *testing.T, res *mcp.CallToolResult, want ErrorCode) {
+func assertToolError(t *testing.T, res *mcpsdk.CallToolResult, want apperr.Code) {
 	t.Helper()
 	if res == nil || !res.IsError {
 		t.Fatalf("expected IsError result, got %+v", res)
@@ -184,9 +187,9 @@ func assertToolError(t *testing.T, res *mcp.CallToolResult, want ErrorCode) {
 	if !ok {
 		t.Fatalf("want structured payload, got %T", res.StructuredContent)
 	}
-	te, ok := payload["error"].(*ToolError)
+	te, ok := payload["error"].(*apperr.Error)
 	if !ok {
-		t.Fatalf("want *ToolError, got %T", payload["error"])
+		t.Fatalf("want *apperr.Error, got %T", payload["error"])
 	}
 	if te.Code != want {
 		t.Fatalf("want %s, got %s (%s)", want, te.Code, te.Message)
@@ -196,8 +199,8 @@ func assertToolError(t *testing.T, res *mcp.CallToolResult, want ErrorCode) {
 // Text-only clients (including Code Mode bindings) surface content[0].text and
 // drop structuredContent, so the actionable language list must be in the text.
 func TestErrorTextIncludesAvailableLanguages(t *testing.T) {
-	res := errorResult(&ToolError{
-		Code:               CodeNoMatchingLang,
+	res := errorResult(&apperr.Error{
+		Code:               apperr.CodeNoMatchingLang,
 		Message:            "No caption track matches requested languages xx.",
 		AvailableLanguages: []string{"en", "es"},
 		Suggestion:         "Retry with one of available_languages.",
@@ -205,7 +208,7 @@ func TestErrorTextIncludesAvailableLanguages(t *testing.T) {
 	if !res.IsError {
 		t.Fatal("expected IsError")
 	}
-	tc, ok := res.Content[0].(*mcp.TextContent)
+	tc, ok := res.Content[0].(*mcpsdk.TextContent)
 	if !ok {
 		t.Fatalf("want TextContent, got %T", res.Content[0])
 	}

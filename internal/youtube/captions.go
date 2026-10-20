@@ -1,5 +1,5 @@
-// Transcript model, track selection, and caption download/parsing.
-package main
+// Track selection and caption download/parsing.
+package youtube
 
 import (
 	"context"
@@ -10,50 +10,12 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"yt/internal/apperr"
+	"yt/internal/transcript"
 )
 
-var (
-	videoIDPattern = regexp.MustCompile(
-		`(?:youtube\.com/(?:watch\?[^#\s]*v=|shorts/|live/|embed/|v/)|youtu\.be/)([\w-]{11})`)
-	bareIDPattern = regexp.MustCompile(`^[\w-]{11}$`)
-)
-
-// OriginalLanguageValue is the sentinel an agent passes to ask for the video's
-// own track with no machine translation.
-const OriginalLanguageValue = "original"
-
-func extractVideoID(urlOrID string) (string, error) {
-	s := strings.TrimSpace(urlOrID)
-	if bareIDPattern.MatchString(s) {
-		return s, nil
-	}
-	if m := videoIDPattern.FindStringSubmatch(s); m != nil {
-		return m[1], nil
-	}
-	te := newToolError(CodeInvalidID, "could not extract a YouTube video id from %q", urlOrID)
-	te.Suggestion = "Pass a watch/youtu.be/shorts/live/embed URL or a bare 11-character video ID."
-	return "", te
-}
-
-type Segment struct {
-	Start    float64 `json:"start"`
-	Duration float64 `json:"duration"`
-	Text     string  `json:"text"`
-}
-
-type Transcript struct {
-	VideoID            string    `json:"video_id"`
-	Source             string    `json:"source"` // innertube-android | innertube-ios | watch-page
-	Language           string    `json:"language"`
-	OriginalLanguage   string    `json:"original_language"`
-	TranslationTarget  string    `json:"translation_target,omitempty"`
-	RequestedLanguages []string  `json:"requested_languages,omitempty"`
-	Generated          bool      `json:"generated"`
-	Translated         bool      `json:"translated"`
-	DurationSeconds    int       `json:"duration_seconds"`
-	Segments           []Segment `json:"segments"`
-}
-
+// TranscriptOptions controls caption-track selection.
 type TranscriptOptions struct {
 	Languages        []string
 	AllowTranslation bool
@@ -73,10 +35,10 @@ func normalizeLanguages(langs []string) []string {
 // selectAndDownload picks a track and downloads it. Translation is opt-in:
 // when a requested language is unavailable and translation is disabled, the
 // caller gets a typed error listing what is available.
-func selectAndDownload(ctx context.Context, videoID string, pr *playerResponse, via string, opts TranscriptOptions) (*Transcript, error) {
+func (c *Client) selectAndDownload(ctx context.Context, videoID string, pr *playerResponse, via string, opts TranscriptOptions) (*transcript.Transcript, error) {
 	tracks := pr.tracks()
 	if len(tracks) == 0 {
-		te := newToolError(CodeNoCaptions, "This video has no caption tracks.")
+		te := apperr.New(apperr.CodeNoCaptions, "This video has no caption tracks.")
 		te.Suggestion = "Captions may be disabled by the uploader; get_video_info confirms availability."
 		return nil, te
 	}
@@ -85,17 +47,17 @@ func selectAndDownload(ctx context.Context, videoID string, pr *playerResponse, 
 	if err != nil {
 		return nil, err
 	}
-	segs, err := downloadSegments(ctx, track.BaseURL, target, needsTlang)
+	segs, err := c.downloadSegments(ctx, track.BaseURL, target, needsTlang)
 	if err != nil {
 		return nil, err
 	}
 	if len(segs) == 0 {
-		te := newToolError(CodeNoCaptions, "The caption track for %s is empty.", track.LanguageCode)
+		te := apperr.New(apperr.CodeNoCaptions, "The caption track for %s is empty.", track.LanguageCode)
 		te.Suggestion = "Retry or request a different language; the track may be unusable."
 		return nil, te
 	}
 	language, originalLanguage, translationTarget, translated := transcriptIdentity(track, orig, needsTlang, target)
-	return &Transcript{
+	return &transcript.Transcript{
 		VideoID:            videoID,
 		Source:             via,
 		Language:           language,
@@ -267,8 +229,8 @@ func originalTrackFrom(pr *playerResponse) *captionTrack {
 	return nil
 }
 
-func noMatchingLanguage(tracks []captionTrack, langs []string) *ToolError {
-	te := newToolError(CodeNoMatchingLang,
+func noMatchingLanguage(tracks []captionTrack, langs []string) *apperr.Error {
+	te := apperr.New(apperr.CodeNoMatchingLang,
 		"No caption track matches requested languages %s.", strings.Join(langs, ","))
 	te.AvailableLanguages = trackLanguages(tracks)
 	te.Suggestion = "Retry with one of available_languages, pass \"original\", or set allow_translation=true."
@@ -290,7 +252,7 @@ func trackLanguages(tracks []captionTrack) []string {
 func captionURL(baseURL, format, tlang string, translate bool) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return "", newToolError(CodeUpstreamChanged, "invalid caption URL: %v", err)
+		return "", apperr.New(apperr.CodeUpstreamChanged, "invalid caption URL: %v", err)
 	}
 	q := u.Query()
 	q.Set("fmt", format)
@@ -305,7 +267,7 @@ func captionURL(baseURL, format, tlang string, translate bool) (string, error) {
 // the format parameter. A transport failure on one format no longer aborts the
 // fallback, and if both formats parse to zero cues the track is genuinely empty
 // (reported as no_captions by the caller).
-func downloadSegments(ctx context.Context, baseURL, targetLang string, translate bool) ([]Segment, error) {
+func (c *Client) downloadSegments(ctx context.Context, baseURL, targetLang string, translate bool) ([]transcript.Segment, error) {
 	var errs []error
 	for _, format := range []string{"json3", "srv3"} {
 		u, err := captionURL(baseURL, format, targetLang, translate)
@@ -313,7 +275,7 @@ func downloadSegments(ctx context.Context, baseURL, targetLang string, translate
 			errs = append(errs, err)
 			continue
 		}
-		resp, err := requestWithRetry(ctx, http.MethodGet, u, nil, map[string]string{
+		resp, err := c.requestWithRetry(ctx, http.MethodGet, u, nil, map[string]string{
 			"User-Agent": browserUA,
 		})
 		if err != nil {
@@ -325,14 +287,14 @@ func downloadSegments(ctx context.Context, baseURL, targetLang string, translate
 			errs = append(errs, err)
 			continue
 		}
-		var segs []Segment
+		var segs []transcript.Segment
 		if format == "json3" {
 			segs, err = parseJSON3(body)
 		} else {
 			segs, err = parseTimedXML(body)
 		}
 		if err != nil {
-			errs = append(errs, newToolError(CodeUpstreamChanged, "caption %s parse failed: %v", format, err))
+			errs = append(errs, apperr.New(apperr.CodeUpstreamChanged, "caption %s parse failed: %v", format, err))
 			continue
 		}
 		if len(segs) > 0 {
@@ -342,7 +304,7 @@ func downloadSegments(ctx context.Context, baseURL, targetLang string, translate
 	if len(errs) == 0 {
 		return nil, nil
 	}
-	return nil, aggregateToolErrors(errs)
+	return nil, apperr.Aggregate(errs)
 }
 
 // ---- json3 format ----
@@ -357,12 +319,12 @@ type json3Doc struct {
 	} `json:"events"`
 }
 
-func parseJSON3(body []byte) ([]Segment, error) {
+func parseJSON3(body []byte) ([]transcript.Segment, error) {
 	var doc json3Doc
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, err
 	}
-	var out []Segment
+	var out []transcript.Segment
 	for _, ev := range doc.Events {
 		var b strings.Builder
 		for _, s := range ev.Segs {
@@ -372,7 +334,7 @@ func parseJSON3(body []byte) ([]Segment, error) {
 		if text == "" {
 			continue
 		}
-		out = append(out, Segment{
+		out = append(out, transcript.Segment{
 			Start:    float64(ev.StartMs) / 1000,
 			Duration: float64(ev.DurationMs) / 1000,
 			Text:     text,
@@ -384,7 +346,7 @@ func parseJSON3(body []byte) ([]Segment, error) {
 
 // deriveDurations backfills missing durations from the next cue's start so that
 // block grouping and SRT output stay sane for both json3 and srv3 payloads.
-func deriveDurations(segs []Segment) {
+func deriveDurations(segs []transcript.Segment) {
 	for i := range segs {
 		if segs[i].Duration <= 0 {
 			if i+1 < len(segs) {
@@ -420,12 +382,12 @@ var (
 	brTag       = regexp.MustCompile(`<br\s*/?>`)
 )
 
-func parseTimedXML(body []byte) ([]Segment, error) {
+func parseTimedXML(body []byte) ([]transcript.Segment, error) {
 	var doc timedXML
 	if err := xml.Unmarshal(body, &doc); err != nil {
 		return nil, err
 	}
-	var out []Segment
+	var out []transcript.Segment
 	for _, p := range doc.Paras {
 		text := p.HTML
 		text = brTag.ReplaceAllString(text, " ")
@@ -436,7 +398,7 @@ func parseTimedXML(body []byte) ([]Segment, error) {
 		if text == "" {
 			continue
 		}
-		out = append(out, Segment{
+		out = append(out, transcript.Segment{
 			Start:    float64(p.T) / 1000,
 			Duration: float64(p.D) / 1000,
 			Text:     text,

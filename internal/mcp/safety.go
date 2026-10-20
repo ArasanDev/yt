@@ -2,11 +2,14 @@
 // can contain text that reads like an instruction to the agent. yt never obeys
 // it; these warnings simply surface the shape so the caller can quote rather
 // than act.
-package main
+package mcp
 
 import (
 	"fmt"
 	"strings"
+
+	"yt/internal/search"
+	"yt/internal/transcript"
 )
 
 var instructionPatterns = []string{
@@ -25,7 +28,7 @@ var instructionPatterns = []string{
 // intentionally narrow: false positives are worse than a missed hint, because
 // every transcript is already labelled content_trust=untrusted.
 func detectInstructionText(text string) []string {
-	lower := normalizeSearchText(text)
+	lower := search.NormalizeText(text)
 	var out []string
 	for _, p := range instructionPatterns {
 		if strings.Contains(lower, p) {
@@ -39,7 +42,7 @@ func detectInstructionText(text string) []string {
 	return out
 }
 
-func segmentsText(segs []Segment) string {
+func segmentsText(segs []transcript.Segment) string {
 	var b strings.Builder
 	for _, s := range segs {
 		b.WriteString(s.Text)

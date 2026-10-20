@@ -1,4 +1,4 @@
-package main
+package youtube
 
 import (
 	"context"
@@ -10,11 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"yt/internal/apperr"
 )
 
 type fakeChannelServer struct {
 	server       *httptest.Server
+	client       *Client
 	resolveCalls int32
 	feedCalls    int32
 	browseID     string
@@ -45,13 +46,11 @@ func newFakeChannel(t *testing.T) (*fakeChannelServer, func()) {
 	})
 	srv := httptest.NewServer(mux)
 	f.server = srv
-	oldResolve, oldFeed := resolveChannelURL, channelFeedURL
-	resolveChannelURL = srv.URL + "/resolve"
-	channelFeedURL = srv.URL + "/feed?channel_id="
-	return f, func() {
-		resolveChannelURL, channelFeedURL = oldResolve, oldFeed
-		srv.Close()
-	}
+	cfg := DefaultConfig()
+	cfg.ResolveURL = srv.URL + "/resolve"
+	cfg.FeedURL = srv.URL + "/feed?channel_id="
+	f.client = NewClientWithConfig(cfg)
+	return f, srv.Close
 }
 
 // makeFeed builds an Atom feed with n entries, one hour apart, newest = base+n-1.
@@ -79,7 +78,7 @@ func TestParseChannelRef(t *testing.T) {
 		wantID     string
 		wantURL    string
 		wantHandle string
-		wantCode   ErrorCode
+		wantCode   apperr.Code
 	}{
 		{in: "@aiDotEngineer", wantURL: "https://www.youtube.com/@aiDotEngineer", wantHandle: "aiDotEngineer"},
 		{in: "aiDotEngineer", wantURL: "https://www.youtube.com/@aiDotEngineer", wantHandle: "aiDotEngineer"},
@@ -91,17 +90,17 @@ func TestParseChannelRef(t *testing.T) {
 		{in: "https://www.youtube.com/channel/UCG6qpjVnBTTT8wLGBygANOQ", wantID: "UCG6qpjVnBTTT8wLGBygANOQ"},
 		{in: "https://www.youtube.com/c/SomeName", wantURL: "https://www.youtube.com/c/SomeName"},
 		{in: "https://www.youtube.com/user/SomeName", wantURL: "https://www.youtube.com/user/SomeName"},
-		{in: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", wantCode: CodeNotAChannel},
-		{in: "https://www.youtube.com/shorts/dQw4w9WgXcQ", wantCode: CodeNotAChannel},
-		{in: "https://youtu.be/dQw4w9WgXcQ", wantCode: CodeNotAChannel},
-		{in: "https://example.com/@x", wantCode: CodeNotAChannel},
-		{in: "https://www.youtube.com/", wantCode: CodeNotAChannel},
-		{in: "", wantCode: CodeBadRequest},
+		{in: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", wantCode: apperr.CodeNotAChannel},
+		{in: "https://www.youtube.com/shorts/dQw4w9WgXcQ", wantCode: apperr.CodeNotAChannel},
+		{in: "https://youtu.be/dQw4w9WgXcQ", wantCode: apperr.CodeNotAChannel},
+		{in: "https://example.com/@x", wantCode: apperr.CodeNotAChannel},
+		{in: "https://www.youtube.com/", wantCode: apperr.CodeNotAChannel},
+		{in: "", wantCode: apperr.CodeBadRequest},
 	}
 	for _, tc := range cases {
 		got, err := parseChannelRef(tc.in)
 		if tc.wantCode != "" {
-			te, ok := toolErrorOf(err)
+			te, ok := apperr.As(err)
 			if !ok || te.Code != tc.wantCode {
 				t.Errorf("%q: want code %s, got %v", tc.in, tc.wantCode, err)
 			}
@@ -123,7 +122,7 @@ func TestChannelListingNewestFirstAndSince(t *testing.T) {
 	defer cleanup()
 	f.feedXML = makeFeed("AI Engineer", 3) // newest = 2026-10-01T14:00:00Z
 
-	c := NewClient()
+	c := f.client
 	got, err := c.Channel(context.Background(), "@chan", ChannelOptions{Limit: 10, SummaryChars: 200})
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +172,7 @@ func TestChannelLimitTruncates(t *testing.T) {
 	defer cleanup()
 	f.feedXML = makeFeed("Chan", 3)
 
-	got, err := NewClient().Channel(context.Background(), "@chan", ChannelOptions{Limit: 2, SummaryChars: 0})
+	got, err := f.client.Channel(context.Background(), "@chan", ChannelOptions{Limit: 2, SummaryChars: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +189,7 @@ func TestChannelMemoizesResolveAndFeed(t *testing.T) {
 	defer cleanup()
 	f.feedXML = makeFeed("Chan", 2)
 
-	c := NewClient()
+	c := f.client
 	for i := 0; i < 2; i++ {
 		if _, err := c.Channel(context.Background(), "@chan", ChannelOptions{Limit: 10}); err != nil {
 			t.Fatal(err)
@@ -209,7 +208,7 @@ func TestChannelDirectIDSkipsResolve(t *testing.T) {
 	defer cleanup()
 	f.feedXML = makeFeed("Chan", 1)
 
-	got, err := NewClient().Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{Limit: 10})
+	got, err := f.client.Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,9 +225,9 @@ func TestChannelErrors(t *testing.T) {
 		f, cleanup := newFakeChannel(t)
 		defer cleanup()
 		f.browseID = ""
-		_, err := NewClient().Channel(context.Background(), "@nope", ChannelOptions{})
-		te, ok := toolErrorOf(err)
-		if !ok || te.Code != CodeChannelNotFound {
+		_, err := f.client.Channel(context.Background(), "@nope", ChannelOptions{})
+		te, ok := apperr.As(err)
+		if !ok || te.Code != apperr.CodeChannelNotFound {
 			t.Fatalf("want channel_not_found, got %v", err)
 		}
 	})
@@ -236,9 +235,9 @@ func TestChannelErrors(t *testing.T) {
 		f, cleanup := newFakeChannel(t)
 		defer cleanup()
 		f.feedStatus = http.StatusNotFound
-		_, err := NewClient().Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{})
-		te, ok := toolErrorOf(err)
-		if !ok || te.Code != CodeChannelNotFound {
+		_, err := f.client.Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{})
+		te, ok := apperr.As(err)
+		if !ok || te.Code != apperr.CodeChannelNotFound {
 			t.Fatalf("want channel_not_found, got %v", err)
 		}
 	})
@@ -246,9 +245,9 @@ func TestChannelErrors(t *testing.T) {
 		f, cleanup := newFakeChannel(t)
 		defer cleanup()
 		f.feedXML = "<feed><entry>"
-		_, err := NewClient().Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{})
-		te, ok := toolErrorOf(err)
-		if !ok || te.Code != CodeUpstreamChanged {
+		_, err := f.client.Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{})
+		te, ok := apperr.As(err)
+		if !ok || te.Code != apperr.CodeUpstreamChanged {
 			t.Fatalf("want upstream_changed, got %v", err)
 		}
 	})
@@ -256,7 +255,7 @@ func TestChannelErrors(t *testing.T) {
 		f, cleanup := newFakeChannel(t)
 		defer cleanup()
 		f.feedXML = `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Quiet</title></feed>`
-		got, err := NewClient().Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{})
+		got, err := f.client.Channel(context.Background(), "UCG6qpjVnBTTT8wLGBygANOQ", ChannelOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -267,64 +266,20 @@ func TestChannelErrors(t *testing.T) {
 }
 
 func TestParseSince(t *testing.T) {
-	got, err := parseSince("2026-10-01T00:00:00Z")
+	got, err := ParseSince("2026-10-01T00:00:00Z")
 	if err != nil || got.Format(time.RFC3339) != "2026-10-01T00:00:00Z" {
 		t.Fatalf("rfc3339: %v %v", got, err)
 	}
-	got, err = parseSince("2026-10-01")
+	got, err = ParseSince("2026-10-01")
 	if err != nil || got.Format(time.RFC3339) != "2026-10-01T00:00:00Z" {
 		t.Fatalf("date: %v %v", got, err)
 	}
-	if _, err := parseSince("last tuesday"); err == nil {
+	if _, err := ParseSince("last tuesday"); err == nil {
 		t.Fatal("want error for a non-time")
 	}
-	_, err = parseSince("nope")
-	te, ok := toolErrorOf(err)
-	if !ok || te.Code != CodeBadRequest {
+	_, err = ParseSince("nope")
+	te, ok := apperr.As(err)
+	if !ok || te.Code != apperr.CodeBadRequest {
 		t.Fatalf("want bad_request, got %v", err)
 	}
-}
-
-func TestMCPListChannelVideos(t *testing.T) {
-	f, cleanup := newFakeChannel(t)
-	defer cleanup()
-	f.feedXML = makeFeed("AI Engineer", 12)
-
-	s := &MCPServer{client: NewClient()}
-	res, _, err := s.listChannelVideos(context.Background(), nil, channelIn{Channel: "@aiDotEngineer"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.IsError {
-		t.Fatalf("unexpected tool error: %v", res.Content)
-	}
-	listing, ok := res.StructuredContent.(*ChannelListing)
-	if !ok {
-		t.Fatalf("want *ChannelListing, got %T", res.StructuredContent)
-	}
-	if listing.Count != 10 || !listing.Truncated || listing.Available != 12 {
-		t.Fatalf("default limit: count=%d available=%d truncated=%v", listing.Count, listing.Available, listing.Truncated)
-	}
-	tc, ok := res.Content[0].(*mcp.TextContent)
-	if !ok || tc.Text == "" {
-		t.Fatalf("want a non-empty text block, got %#v", res.Content[0])
-	}
-
-	// limit=0 means all feed entries.
-	zero := 0
-	res, _, err = s.listChannelVideos(context.Background(), nil, channelIn{Channel: "@aiDotEngineer", Limit: &zero})
-	if err != nil {
-		t.Fatal(err)
-	}
-	listing = res.StructuredContent.(*ChannelListing)
-	if listing.Count != 12 || listing.Truncated {
-		t.Fatalf("limit=0: count=%d truncated=%v", listing.Count, listing.Truncated)
-	}
-
-	// A bad since is a typed error result, not a Go error.
-	res, _, err = s.listChannelVideos(context.Background(), nil, channelIn{Channel: "@aiDotEngineer", Since: "yesterday"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertToolError(t, res, CodeBadRequest)
 }

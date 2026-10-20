@@ -1,12 +1,14 @@
 // Chapters are authored structure that already travels inside the description.
 // Parsing them costs one regex pass and turns a 50-minute talk into addressable
 // sections, which is what reading and citation plans actually need.
-package main
+package youtube
 
 import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"yt/internal/transcript"
 )
 
 // Chapter is an author-supplied section marker.
@@ -59,7 +61,7 @@ func parseChapters(desc string, durationSeconds int) []Chapter {
 		sec := chapterSeconds(m[1], m[2], m[3])
 		out = append(out, Chapter{
 			StartSeconds: sec,
-			Timestamp:    tsShort(float64(sec)),
+			Timestamp:    transcript.Timestamp(float64(sec)),
 			Title:        title,
 		})
 		if len(out) >= 200 {

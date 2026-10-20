@@ -1,4 +1,4 @@
-package main
+package youtube
 
 import (
 	"context"
@@ -9,10 +9,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"yt/internal/apperr"
 )
 
 type fakeYouTube struct {
 	server      *httptest.Server
+	client      *Client
 	playerCalls int32
 	json3Calls  int32
 	srv3Calls   int32
@@ -64,20 +67,18 @@ func newFakeYouTube(t *testing.T) (*fakeYouTube, func()) {
 	f.server = srv
 	f.captionBase = srv.URL + "/captions?x=1&fmt=srv3"
 
-	oldInnertube, oldWatch := innertubeURL, watchPageURL
-	innertubeURL = srv.URL + "/youtubei/v1/player?prettyPrint=false"
-	watchPageURL = srv.URL + "/watch?v="
-	return f, func() {
-		innertubeURL, watchPageURL = oldInnertube, oldWatch
-		srv.Close()
-	}
+	cfg := DefaultConfig()
+	cfg.InnertubeURL = srv.URL + "/youtubei/v1/player?prettyPrint=false"
+	cfg.WatchPageURL = srv.URL + "/watch?v="
+	f.client = NewClientWithConfig(cfg)
+	return f, srv.Close
 }
 
 func TestPlayerIsFetchedOncePerVideo(t *testing.T) {
 	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	c := NewClient()
+	c := f.client
 	for i := 0; i < 3; i++ {
 		if _, _, err := c.Player(context.Background(), "testvideo01"); err != nil {
 			t.Fatalf("call %d: %v", i, err)
@@ -92,7 +93,7 @@ func TestTranscriptIsDownloadedOnce(t *testing.T) {
 	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	c := NewClient()
+	c := f.client
 	opts := TranscriptOptions{Languages: []string{"en"}, AllowTranslation: true}
 	for i := 0; i < 2; i++ {
 		if _, err := c.Transcript(context.Background(), "testvideo01", opts); err != nil {
@@ -110,11 +111,11 @@ func TestNegativeCacheForBotCheck(t *testing.T) {
 	f.playability = "LOGIN_REQUIRED"
 	f.reason = "Sign in to confirm you're not a bot"
 
-	c := NewClient()
+	c := f.client
 	for i := 0; i < 2; i++ {
 		_, _, err := c.Player(context.Background(), "testvideo01")
-		te, ok := toolErrorOf(err)
-		if !ok || te.Code != CodeBotCheck {
+		te, ok := apperr.As(err)
+		if !ok || te.Code != apperr.CodeBotCheck {
 			t.Fatalf("want bot_check, got %v", err)
 		}
 	}
@@ -129,9 +130,9 @@ func TestPrivateVideoClassification(t *testing.T) {
 	f.playability = "LOGIN_REQUIRED"
 	f.reason = "This video is private"
 
-	_, _, err := NewClient().Player(context.Background(), "testvideo01")
-	te, ok := toolErrorOf(err)
-	if !ok || te.Code != CodePrivate {
+	_, _, err := f.client.Player(context.Background(), "testvideo01")
+	te, ok := apperr.As(err)
+	if !ok || te.Code != apperr.CodePrivate {
 		t.Fatalf("want private, got %v", err)
 	}
 	if te.Suggestion == "" {
@@ -140,11 +141,11 @@ func TestPrivateVideoClassification(t *testing.T) {
 }
 
 func TestBotCheckIsNotReportedAsPrivate(t *testing.T) {
-	te := classifyPlayability("LOGIN_REQUIRED", "Sign in to confirm you're not a bot")
-	if te.Code != CodeBotCheck {
+	te := apperr.ClassifyPlayability("LOGIN_REQUIRED", "Sign in to confirm you're not a bot")
+	if te.Code != apperr.CodeBotCheck {
 		t.Fatalf("bot check must not be classified as private, got %s", te.Code)
 	}
-	if te.Code == CodePrivate {
+	if te.Code == apperr.CodePrivate {
 		t.Fatal("explicitly wrong")
 	}
 }
@@ -154,7 +155,7 @@ func TestDownloadSegmentsFallsBackWhenJSON3Fails(t *testing.T) {
 	defer cleanup()
 	f.json3Status = http.StatusTooManyRequests
 
-	segs, err := downloadSegments(context.Background(), f.captionBase, "", false)
+	segs, err := f.client.downloadSegments(context.Background(), f.captionBase, "", false)
 	if err != nil {
 		t.Fatalf("fallback failed: %v", err)
 	}
@@ -167,10 +168,10 @@ func TestDownloadSegmentsFallsBackWhenJSON3Fails(t *testing.T) {
 }
 
 func TestTranscriptSourceIsSet(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	tr, err := NewClient().Transcript(context.Background(), "testvideo01",
+	tr, err := f.client.Transcript(context.Background(), "testvideo01",
 		TranscriptOptions{Languages: []string{"en"}, AllowTranslation: true})
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +185,7 @@ func TestJSON3IsUsedWhenBaseURLHasSrv3(t *testing.T) {
 	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	segs, err := downloadSegments(context.Background(), f.captionBase, "", false)
+	segs, err := f.client.downloadSegments(context.Background(), f.captionBase, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,11 +201,11 @@ func TestJSON3IsUsedWhenBaseURLHasSrv3(t *testing.T) {
 }
 
 func TestRateLimitedAggregationPreservesRetryAfter(t *testing.T) {
-	te := aggregateToolErrors([]error{
-		&ToolError{Code: CodeRateLimited, Retryable: true, RetryAfterSeconds: 7},
-		&ToolError{Code: CodeRateLimited, Retryable: true},
+	te := apperr.Aggregate([]error{
+		&apperr.Error{Code: apperr.CodeRateLimited, Retryable: true, RetryAfterSeconds: 7},
+		&apperr.Error{Code: apperr.CodeRateLimited, Retryable: true},
 	})
-	if te.Code != CodeRateLimited {
+	if te.Code != apperr.CodeRateLimited {
 		t.Fatalf("want rate_limited, got %s", te.Code)
 	}
 	if te.RetryAfterSeconds != 7 || !te.Retryable {
@@ -213,10 +214,10 @@ func TestRateLimitedAggregationPreservesRetryAfter(t *testing.T) {
 }
 
 func TestInfoReportsCaptionsAndEstimate(t *testing.T) {
-	_, cleanup := newFakeYouTube(t)
+	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 
-	info, err := NewClient().Info(context.Background(), "testvideo01", 500)
+	info, err := f.client.Info(context.Background(), "testvideo01", 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,11 +237,11 @@ func TestRequestRetryRespectsCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := requestWithRetry(ctx, http.MethodGet, srv.URL, nil, nil)
+	_, err := NewClient().requestWithRetry(ctx, http.MethodGet, srv.URL, nil, nil)
 	if err == nil {
 		t.Fatal("expected a timeout error")
 	}
-	if te, ok := toolErrorOf(err); !ok || te.Code != CodeTimeout {
+	if te, ok := apperr.As(err); !ok || te.Code != apperr.CodeTimeout {
 		t.Fatalf("want timeout code, got %v", err)
 	}
 }

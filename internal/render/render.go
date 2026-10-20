@@ -1,21 +1,27 @@
-// Rendering: turn segments into agent-sized text with structural truncation
-// metadata. Truncation state is reported in the header and in structured
-// metadata, never only in a trailing footer (clients cut the tail first).
-package main
+// Package render turns transcript segments into agent-sized text with
+// structural truncation metadata. Truncation state is reported in the header
+// and in structured metadata, never only in a trailing footer (clients cut the
+// tail first).
+package render
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"yt/internal/transcript"
 )
 
 const (
-	blockSeconds = 30.0 // granularity=block window
-	blockGap     = 2.5  // seconds of silence that also starts a new block
+	// BlockSeconds is the granularity=block window, also reported as the
+	// timestamp precision in structured metadata.
+	BlockSeconds = 30.0
+	blockGap     = 2.5 // seconds of silence that also starts a new block
 )
 
-type RenderOptions struct {
+// Options control range selection and rendering.
+type Options struct {
 	Granularity   string  // cue | block
 	TimestampMode string  // none | block | cue
 	StartSeconds  float64 // 0 = from beginning
@@ -25,6 +31,7 @@ type RenderOptions struct {
 	MaxChars      int // 0 = unlimited; bounds the body only
 }
 
+// Rendered is the text rendering plus its truncation metadata.
 type Rendered struct {
 	Text             string
 	Granularity      string
@@ -44,9 +51,23 @@ type Rendered struct {
 	Coverage         string
 }
 
+// JSONSelection is the cue-level counterpart of Rendered: the same selection
+// and char budget, but expressed as raw segments so meta and payload agree.
+type JSONSelection struct {
+	Segments         []transcript.Segment
+	ReturnedCues     int
+	ReturnedWords    int
+	TotalChars       int
+	ReturnedChars    int
+	Truncated        bool
+	NextStartSeconds *float64
+	NextCueIndex     *int
+	Coverage         string
+}
+
 type idxSeg struct {
 	i   int
-	seg Segment
+	seg transcript.Segment
 }
 
 type renderBlock struct {
@@ -88,7 +109,7 @@ func normalizeTimestampMode(m string, legacyTimestamps bool) (string, []string) 
 	}
 }
 
-func selectSegments(segs []Segment, opts RenderOptions) []idxSeg {
+func selectSegments(segs []transcript.Segment, opts Options) []idxSeg {
 	start := 0
 	if opts.StartCue > 0 {
 		start = opts.StartCue
@@ -123,6 +144,17 @@ func selectSegments(segs []Segment, opts RenderOptions) []idxSeg {
 	return out
 }
 
+// Select returns the raw segments in the requested range. It is used by SRT
+// output, where the rendered text blocks are not wanted.
+func Select(segs []transcript.Segment, opts Options) []transcript.Segment {
+	sel := selectSegments(segs, opts)
+	out := make([]transcript.Segment, 0, len(sel))
+	for _, s := range sel {
+		out = append(out, s.seg)
+	}
+	return out
+}
+
 func buildBlocks(sel []idxSeg, granularity string) []renderBlock {
 	var blocks []renderBlock
 	for _, is := range sel {
@@ -134,7 +166,7 @@ func buildBlocks(sel []idxSeg, granularity string) []renderBlock {
 			continue
 		}
 		cur := &blocks[len(blocks)-1]
-		if s.Start-cur.Start >= blockSeconds || s.Start-cur.End > blockGap {
+		if s.Start-cur.Start >= BlockSeconds || s.Start-cur.End > blockGap {
 			blocks = append(blocks, renderBlock{
 				Start: s.Start, End: s.Start + s.Duration, Text: s.Text, FirstCue: is.i, CueCount: 1,
 			})
@@ -152,11 +184,11 @@ func buildBlocks(sel []idxSeg, granularity string) []renderBlock {
 func renderLine(blk renderBlock, mode string, nextStamp *float64) string {
 	switch mode {
 	case "cue":
-		return "[" + tsShort(blk.Start) + "] " + blk.Text
+		return "[" + transcript.Timestamp(blk.Start) + "] " + blk.Text
 	case "block":
 		if blk.Start >= *nextStamp {
-			*nextStamp = blk.Start + blockSeconds
-			return "[" + tsShort(blk.Start) + "] " + blk.Text
+			*nextStamp = blk.Start + BlockSeconds
+			return "[" + transcript.Timestamp(blk.Start) + "] " + blk.Text
 		}
 	}
 	return blk.Text
@@ -165,26 +197,33 @@ func renderLine(blk renderBlock, mode string, nextStamp *float64) string {
 // transcriptHeader deliberately reports returned/total pairs. The header is
 // the part a client always keeps, so "cues=2/1346" prevents an agent from
 // mistaking a sliced result for the whole transcript.
-func transcriptHeader(t *Transcript, durationSeconds, returnedCues, totalCues, returnedWords, totalWords int) string {
+func transcriptHeader(t *transcript.Transcript, durationSeconds, returnedCues, totalCues, returnedWords, totalWords int) string {
 	parts := []string{
 		"# transcript",
 		"video=" + t.VideoID,
 		"language=" + t.Language,
 		"original_language=" + t.OriginalLanguage,
 		fmt.Sprintf("translated=%v", t.Translated),
-		"source=" + describeVia(t.Source),
+		"source=" + describeSource(t.Source),
 		fmt.Sprintf("generated=%v", t.Generated),
 		fmt.Sprintf("cues=%d/%d", returnedCues, totalCues),
 		fmt.Sprintf("words=%d/%d", returnedWords, totalWords),
 		"content=untrusted",
 	}
 	if durationSeconds > 0 {
-		parts = append(parts, "duration="+tsShort(float64(durationSeconds)))
+		parts = append(parts, "duration="+transcript.Timestamp(float64(durationSeconds)))
 	}
 	return strings.Join(parts, " | ")
 }
 
-func canonicalChars(segs []Segment) int {
+func describeSource(via string) string {
+	if via == "" {
+		return "unknown"
+	}
+	return via
+}
+
+func canonicalChars(segs []transcript.Segment) int {
 	n := 0
 	for _, s := range segs {
 		n += utf8.RuneCountInString(s.Text) + 1
@@ -192,15 +231,8 @@ func canonicalChars(segs []Segment) int {
 	return n
 }
 
-func totalWords(segs []Segment) int {
-	n := 0
-	for _, s := range segs {
-		n += len(strings.Fields(s.Text))
-	}
-	return n
-}
-
-func Render(t *Transcript, durationSeconds int, opts RenderOptions) Rendered {
+// Render renders a transcript as text.
+func Render(t *transcript.Transcript, durationSeconds int, opts Options) Rendered {
 	gran, notes := normalizeGranularity(opts.Granularity)
 	mode, modeNotes := normalizeTimestampMode(opts.TimestampMode, false)
 	notes = append(notes, modeNotes...)
@@ -210,7 +242,7 @@ func Render(t *Transcript, durationSeconds int, opts RenderOptions) Rendered {
 		Notes:         notes,
 		TotalCues:     len(t.Segments),
 		TotalChars:    canonicalChars(t.Segments),
-		Words:         totalWords(t.Segments),
+		Words:         transcript.WordCount(t.Segments),
 	}
 	blocks := buildBlocks(selectSegments(t.Segments, opts), gran)
 
@@ -261,7 +293,7 @@ func Render(t *Transcript, durationSeconds int, opts RenderOptions) Rendered {
 	}
 
 	r.Coverage = fmt.Sprintf("%s-%s of %s",
-		tsShort(r.StartSeconds), tsShort(r.EndSeconds), tsShort(float64(durationSeconds)))
+		transcript.Timestamp(r.StartSeconds), transcript.Timestamp(r.EndSeconds), transcript.Timestamp(float64(durationSeconds)))
 
 	header := transcriptHeader(t, durationSeconds, r.ReturnedCues, r.TotalCues, r.ReturnedWords, r.Words)
 	if r.Truncated && r.NextStartSeconds != nil && r.NextCueIndex != nil {
@@ -278,7 +310,7 @@ func Render(t *Transcript, durationSeconds int, opts RenderOptions) Rendered {
 	out.WriteString(bodyText)
 	if r.Truncated && r.NextStartSeconds != nil && r.NextCueIndex != nil {
 		fmt.Fprintf(&out, "\n\n[... truncated at %s of %s — continue with start_seconds=%s or start_cue=%d ...]",
-			tsShort(r.EndSeconds), tsShort(float64(durationSeconds)), formatSeconds(*r.NextStartSeconds), *r.NextCueIndex)
+			transcript.Timestamp(r.EndSeconds), transcript.Timestamp(float64(durationSeconds)), formatSeconds(*r.NextStartSeconds), *r.NextCueIndex)
 	}
 	r.Text = out.String()
 	r.ReturnedChars = utf8.RuneCountInString(bodyText)
@@ -289,21 +321,8 @@ func formatSeconds(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-// JSONSelection is the cue-level counterpart of Rendered: the same selection
-// and char budget, but expressed as raw segments so meta and payload agree.
-type JSONSelection struct {
-	Segments         []Segment
-	ReturnedCues     int
-	ReturnedWords    int
-	TotalChars       int
-	ReturnedChars    int
-	Truncated        bool
-	NextStartSeconds *float64
-	NextCueIndex     *int
-	Coverage         string
-}
-
-func selectForJSON(segs []Segment, durationSeconds int, opts RenderOptions) JSONSelection {
+// SelectForJSON returns the cue-level counterpart of Render.
+func SelectForJSON(segs []transcript.Segment, durationSeconds int, opts Options) JSONSelection {
 	sel := selectSegments(segs, opts)
 	res := JSONSelection{TotalChars: canonicalChars(segs)}
 	chars := 0
@@ -343,19 +362,6 @@ func selectForJSON(segs []Segment, durationSeconds int, opts RenderOptions) JSON
 		start = first.Start
 		end = last.Start + last.Duration
 	}
-	res.Coverage = fmt.Sprintf("%s-%s of %s", tsShort(start), tsShort(end), tsShort(float64(durationSeconds)))
+	res.Coverage = fmt.Sprintf("%s-%s of %s", transcript.Timestamp(start), transcript.Timestamp(end), transcript.Timestamp(float64(durationSeconds)))
 	return res
-}
-
-// truncateRunes is rune-safe: byte slicing a description could split a
-// multi-byte character. A limit of 0 means no truncation.
-func truncateRunes(s string, limit int) (string, bool) {
-	if limit <= 0 {
-		return s, false
-	}
-	r := []rune(s)
-	if len(r) <= limit {
-		return s, false
-	}
-	return string(r[:limit]) + "…", true
 }

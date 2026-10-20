@@ -1,12 +1,17 @@
-// Service layer shared by the CLI and the MCP server: one player fetch per
-// video per session, typed errors, and rendered transcripts.
-package main
+// Package youtube acquires video metadata, captions, and channel listings from
+// YouTube's internal endpoints. It owns the cache and the typed failure model;
+// rendering and search live in separate packages.
+package youtube
 
 import (
 	"context"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"yt/internal/apperr"
+	"yt/internal/transcript"
 )
 
 const (
@@ -20,16 +25,66 @@ const (
 	// Rate limits are cached briefly so an agent following retryable=true does
 	// not hammer the endpoint that throttled it.
 	rateLimitedTTL = 15 * time.Second
-	totalDeadline  = 45 * time.Second
 )
 
-type Client struct {
-	memo *Memo
+// TotalDeadline bounds one acquisition operation: player fetch plus caption
+// download share it instead of each getting a fresh budget.
+const TotalDeadline = 45 * time.Second
+
+// DefaultDescriptionChars is the description excerpt used by the CLI and MCP
+// adapter when the caller does not specify one.
+const DefaultDescriptionChars = 500
+
+// Config lets tests and embedders point acquisition at another origin.
+type Config struct {
+	InnertubeURL string
+	WatchPageURL string
+	ResolveURL   string
+	FeedURL      string
+	HTTPClient   *http.Client
 }
 
-func NewClient() *Client { return &Client{memo: NewMemo(32 << 20)} }
+// DefaultConfig returns the production endpoints.
+func DefaultConfig() Config {
+	return Config{
+		InnertubeURL: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+		WatchPageURL: "https://www.youtube.com/watch?v=",
+		ResolveURL:   "https://www.youtube.com/youtubei/v1/navigation/resolve_url?prettyPrint=false",
+		FeedURL:      "https://www.youtube.com/feeds/videos.xml?channel_id=",
+		HTTPClient:   &http.Client{Timeout: perAttemptTimeout},
+	}
+}
 
-var defaultClient = NewClient()
+// Client is a cached YouTube acquisition session.
+type Client struct {
+	memo *Memo
+	cfg  Config
+}
+
+// NewClient returns a client using the production endpoints.
+func NewClient() *Client { return NewClientWithConfig(DefaultConfig()) }
+
+// NewClientWithConfig returns a client with any unset fields filled from
+// DefaultConfig.
+func NewClientWithConfig(cfg Config) *Client {
+	def := DefaultConfig()
+	if cfg.InnertubeURL == "" {
+		cfg.InnertubeURL = def.InnertubeURL
+	}
+	if cfg.WatchPageURL == "" {
+		cfg.WatchPageURL = def.WatchPageURL
+	}
+	if cfg.ResolveURL == "" {
+		cfg.ResolveURL = def.ResolveURL
+	}
+	if cfg.FeedURL == "" {
+		cfg.FeedURL = def.FeedURL
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = def.HTTPClient
+	}
+	return &Client{memo: NewMemo(32 << 20), cfg: cfg}
+}
 
 type playerCache struct {
 	pr  *playerResponse
@@ -41,7 +96,7 @@ type playerCache struct {
 // cannot turn the improved error path into a hot loop.
 func (c *Client) Player(ctx context.Context, videoID string) (*playerResponse, string, error) {
 	if v, ok := c.memo.Get("neg:" + videoID); ok {
-		if te, ok := v.(*ToolError); ok {
+		if te, ok := v.(*apperr.Error); ok {
 			return nil, "", te
 		}
 	}
@@ -49,13 +104,13 @@ func (c *Client) Player(ctx context.Context, videoID string) (*playerResponse, s
 		pv := v.(playerCache)
 		return pv.pr, pv.via, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, totalDeadline)
+	ctx, cancel := context.WithTimeout(ctx, TotalDeadline)
 	defer cancel()
-	pr, via, err := fetchPlayer(ctx, videoID)
+	pr, via, err := c.fetchPlayer(ctx, videoID)
 	if err != nil {
-		if te, ok := toolErrorOf(err); ok {
+		if te, ok := apperr.As(err); ok {
 			switch {
-			case te.Code == CodeRateLimited:
+			case te.Code == apperr.CodeRateLimited:
 				c.memo.Put("neg:"+videoID, te, rateLimitedTTL, 512)
 			case !te.Retryable:
 				c.memo.Put("neg:"+videoID, te, negativeTTL, 512)
@@ -88,24 +143,25 @@ func estimatePlayerSize(pr *playerResponse) int {
 	return size
 }
 
-func (c *Client) Transcript(ctx context.Context, videoID string, opts TranscriptOptions) (*Transcript, error) {
+// Transcript fetches and caches a caption track for a video.
+func (c *Client) Transcript(ctx context.Context, videoID string, opts TranscriptOptions) (*transcript.Transcript, error) {
 	opts.Languages = normalizeLanguages(opts.Languages)
 	if len(opts.Languages) == 0 {
 		opts.Languages = []string{"en"}
 	}
 	key := "tr:" + videoID + "|" + strings.Join(opts.Languages, ",") + "|" + strconv.FormatBool(opts.AllowTranslation)
 	if v, ok := c.memo.Get(key); ok {
-		return v.(*Transcript), nil
+		return v.(*transcript.Transcript), nil
 	}
 	// One deadline for the whole call: player fetch + caption download must not
 	// each get a fresh 45s budget.
-	ctx, cancel := context.WithTimeout(ctx, totalDeadline)
+	ctx, cancel := context.WithTimeout(ctx, TotalDeadline)
 	defer cancel()
 	pr, via, err := c.Player(ctx, videoID)
 	if err != nil {
 		return nil, err
 	}
-	t, err := selectAndDownload(ctx, videoID, pr, via, opts)
+	t, err := c.selectAndDownload(ctx, videoID, pr, via, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -113,14 +169,6 @@ func (c *Client) Transcript(ctx context.Context, videoID string, opts Transcript
 		c.memo.Put(key, t, transcriptTTL, transcriptSize(t))
 	}
 	return t, nil
-}
-
-func (c *Client) SearchTranscript(ctx context.Context, videoID string, langOpts TranscriptOptions, opts SearchOptions) (*Transcript, SearchResult, error) {
-	t, err := c.Transcript(ctx, videoID, langOpts)
-	if err != nil {
-		return nil, SearchResult{}, err
-	}
-	return t, searchSegments(t.Segments, opts), nil
 }
 
 type CaptionSummary struct {
@@ -154,6 +202,7 @@ type VideoInfo struct {
 	Via                       string         `json:"via"`
 }
 
+// Info returns metadata without downloading a caption track.
 func (c *Client) Info(ctx context.Context, videoID string, descriptionChars int) (*VideoInfo, error) {
 	pr, via, err := c.Player(ctx, videoID)
 	if err != nil {
@@ -183,7 +232,7 @@ func (c *Client) Info(ctx context.Context, videoID string, descriptionChars int)
 	// Parse chapters from the full description before truncation: a chapter
 	// list often sits past the excerpt cut-off.
 	chapters := parseChapters(pr.VideoDetails.ShortDescription, duration)
-	desc, truncated := truncateRunes(pr.VideoDetails.ShortDescription, descriptionChars)
+	desc, truncated := transcript.TruncateRunes(pr.VideoDetails.ShortDescription, descriptionChars)
 	estimate := 0
 	if summary.HasCaptions {
 		estimate = duration * 17 // ~17 chars/second observed on real ASR
@@ -215,15 +264,34 @@ func (c *Client) Info(ctx context.Context, videoID string, descriptionChars int)
 	return info, nil
 }
 
-func (c *Client) Tracks(ctx context.Context, videoID string) (*playerResponse, string, []captionTrack, error) {
-	pr, via, err := c.Player(ctx, videoID)
-	if err != nil {
-		return nil, "", nil, err
-	}
-	return pr, via, pr.tracks(), nil
+// Track is the public view of a caption track.
+type Track struct {
+	Language     string
+	Kind         string // "asr" = auto-generated
+	Translatable bool
+	Name         string
 }
 
-func transcriptSize(t *Transcript) int {
+// Tracks lists caption tracks and the acquisition source that produced them.
+func (c *Client) Tracks(ctx context.Context, videoID string) (via string, tracks []Track, err error) {
+	pr, via, err := c.Player(ctx, videoID)
+	if err != nil {
+		return "", nil, err
+	}
+	raw := pr.tracks()
+	tracks = make([]Track, 0, len(raw))
+	for _, t := range raw {
+		tracks = append(tracks, Track{
+			Language:     t.LanguageCode,
+			Kind:         t.Kind,
+			Translatable: t.IsTranslatable,
+			Name:         t.trackName(),
+		})
+	}
+	return via, tracks, nil
+}
+
+func transcriptSize(t *transcript.Transcript) int {
 	n := 0
 	for _, s := range t.Segments {
 		n += len(s.Text) + 24 + 32

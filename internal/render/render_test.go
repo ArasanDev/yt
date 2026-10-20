@@ -1,19 +1,21 @@
-package main
+package render
 
 import (
 	"strings"
 	"testing"
+
+	"yt/internal/transcript"
 )
 
-func testTranscript() *Transcript {
-	var segs []Segment
+func testTranscript() *transcript.Transcript {
+	var segs []transcript.Segment
 	// 40 cues, one per second: enough to span several 30s blocks.
 	for i := 0; i < 40; i++ {
-		segs = append(segs, Segment{
+		segs = append(segs, transcript.Segment{
 			Start: float64(i), Duration: 1, Text: "cue" + string(rune('A'+i%26)) + " word",
 		})
 	}
-	return &Transcript{
+	return &transcript.Transcript{
 		VideoID:          "testvideo01",
 		Source:           "innertube-android",
 		Language:         "en",
@@ -26,7 +28,7 @@ func testTranscript() *Transcript {
 
 func TestRenderBlocksAndTimestamps(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "block", TimestampMode: "block", MaxChars: 0})
+	r := Render(tr, 40, Options{Granularity: "block", TimestampMode: "block", MaxChars: 0})
 	if r.TotalCues != 40 {
 		t.Fatalf("want 40 total cues, got %d", r.TotalCues)
 	}
@@ -52,7 +54,7 @@ func TestRenderBlocksAndTimestamps(t *testing.T) {
 
 func TestRenderCueGranularity(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "cue", TimestampMode: "cue", MaxChars: 0})
+	r := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue", MaxChars: 0})
 	body := r.Text[strings.Index(r.Text, "\n\n")+2:]
 	if got := len(nonEmptyLines(body)); got != 40 {
 		t.Errorf("want 40 cue lines, got %d", got)
@@ -61,7 +63,7 @@ func TestRenderCueGranularity(t *testing.T) {
 
 func TestRenderTruncationHeaderAndPointers(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "cue", TimestampMode: "cue", MaxChars: 400})
+	r := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue", MaxChars: 400})
 	if !r.Truncated {
 		t.Fatal("expected truncation")
 	}
@@ -75,7 +77,7 @@ func TestRenderTruncationHeaderAndPointers(t *testing.T) {
 		t.Errorf("unexpected pointers: cue=%d returned=%d", *r.NextCueIndex, r.ReturnedCues)
 	}
 	// Continuing from the pointer must make progress and eventually finish.
-	rest := Render(tr, 40, RenderOptions{Granularity: "cue", TimestampMode: "cue", StartCue: *r.NextCueIndex, MaxChars: 0})
+	rest := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue", StartCue: *r.NextCueIndex, MaxChars: 0})
 	if rest.ReturnedCues == 0 {
 		t.Fatal("continuation returned nothing")
 	}
@@ -83,7 +85,7 @@ func TestRenderTruncationHeaderAndPointers(t *testing.T) {
 
 func TestRenderTimeRange(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "cue", TimestampMode: "cue", StartSeconds: 10, EndSeconds: 20})
+	r := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue", StartSeconds: 10, EndSeconds: 20})
 	if r.ReturnedCues != 10 {
 		t.Fatalf("want 10 cues for 10s-20s window, got %d", r.ReturnedCues)
 	}
@@ -94,7 +96,7 @@ func TestRenderTimeRange(t *testing.T) {
 
 func TestRenderSentenceFallsBackToBlock(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "sentence"})
+	r := Render(tr, 40, Options{Granularity: "sentence"})
 	if r.Granularity != "block" {
 		t.Errorf("sentence should degrade to block, got %q", r.Granularity)
 	}
@@ -105,7 +107,7 @@ func TestRenderSentenceFallsBackToBlock(t *testing.T) {
 
 func TestTimestampModeNone(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "cue", TimestampMode: "none"})
+	r := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "none"})
 	if strings.Contains(r.Text, "[00:0") {
 		t.Error("timestamp_mode=none must not emit stamps")
 	}
@@ -115,12 +117,12 @@ func TestTimestampModeNone(t *testing.T) {
 // selectSegments skips cues that start before start_seconds, rounding 3.456 up
 // to "3.5" silently dropped the boundary cue.
 func TestResumePointerIsExact(t *testing.T) {
-	tr := &Transcript{VideoID: "v", DurationSeconds: 10, Segments: []Segment{
+	tr := &transcript.Transcript{VideoID: "v", DurationSeconds: 10, Segments: []transcript.Segment{
 		{Start: 0, Duration: 1, Text: "a"},
 		{Start: 3.456, Duration: 1, Text: "boundary cue"},
 		{Start: 5, Duration: 1, Text: "c"},
 	}}
-	r := Render(tr, 10, RenderOptions{Granularity: "cue", TimestampMode: "cue", MaxChars: 10})
+	r := Render(tr, 10, Options{Granularity: "cue", TimestampMode: "cue", MaxChars: 10})
 	if !r.Truncated || r.NextStartSeconds == nil {
 		t.Fatalf("expected truncation, got %+v", r)
 	}
@@ -130,7 +132,7 @@ func TestResumePointerIsExact(t *testing.T) {
 	if !strings.Contains(r.Text, "next_start_seconds=3.456") {
 		t.Errorf("printed pointer is rounded: %q", r.Text)
 	}
-	rest := Render(tr, 10, RenderOptions{
+	rest := Render(tr, 10, Options{
 		Granularity: "cue", TimestampMode: "cue", StartSeconds: *r.NextStartSeconds,
 	})
 	if !strings.Contains(rest.Text, "boundary cue") {
@@ -140,7 +142,7 @@ func TestResumePointerIsExact(t *testing.T) {
 
 func TestMaxCuesReportsContinuation(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "cue", TimestampMode: "cue", MaxCues: 5})
+	r := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue", MaxCues: 5})
 	if !r.Truncated || r.NextCueIndex == nil || *r.NextCueIndex != 5 {
 		t.Fatalf("max_cues must report the next cue, got %+v", r)
 	}
@@ -151,7 +153,7 @@ func TestMaxCuesReportsContinuation(t *testing.T) {
 
 func TestRenderEmptyRangeIsFlagged(t *testing.T) {
 	tr := testTranscript()
-	r := Render(tr, 40, RenderOptions{Granularity: "cue", StartSeconds: 100})
+	r := Render(tr, 40, Options{Granularity: "cue", StartSeconds: 100})
 	if r.ReturnedCues != 0 {
 		t.Fatalf("want empty selection, got %d", r.ReturnedCues)
 	}

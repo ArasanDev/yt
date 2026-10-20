@@ -1,35 +1,39 @@
-// Server-side transcript search: targeted retrieval instead of paging a
-// 50KB blob into the agent's context.
-package main
+// Package search performs server-side transcript search: targeted retrieval
+// instead of paging a 50KB blob into the agent's context.
+package search
 
 import (
 	"fmt"
 	"strings"
 	"unicode"
+
+	"yt/internal/transcript"
 )
 
-// MatchMode decides how a multi-word query is satisfied.
+// Mode decides how a multi-word query is satisfied.
 //
-// all (default) preserves the original behaviour: every term must appear within
-// the cue window. any exists because a literal AND returns a false negative
-// when the speaker paraphrases. phrase requires adjacency.
-type MatchMode string
+// All (default) preserves the original behaviour: every term must appear within
+// the cue window. Any exists because a literal AND returns a false negative
+// when the speaker paraphrases. Phrase requires adjacency.
+type Mode string
 
 const (
-	MatchAll    MatchMode = "all"
-	MatchAny    MatchMode = "any"
-	MatchPhrase MatchMode = "phrase"
+	All    Mode = "all"
+	Any    Mode = "any"
+	Phrase Mode = "phrase"
 )
 
-type SearchOptions struct {
+// Options are the search parameters resolved at the adapter boundary.
+type Options struct {
 	Query       string
 	ContextCues int
 	MaxMatches  int
 	StartCue    int
-	MatchMode   MatchMode
+	MatchMode   Mode
 }
 
-type SearchMatch struct {
+// Match is one matching cue with optional surrounding context.
+type Match struct {
 	CueIndex     int     `json:"cue_index"`
 	StartSeconds float64 `json:"start_seconds"`
 	Timestamp    string  `json:"timestamp"`
@@ -45,10 +49,11 @@ type TermStat struct {
 	Matches int    `json:"matches"`
 }
 
-type SearchResult struct {
-	Matches      []SearchMatch `json:"matches"`
-	TotalMatches int           `json:"total_matches"`
-	Truncated    bool          `json:"truncated"`
+// Result is the complete search response.
+type Result struct {
+	Matches      []Match `json:"matches"`
+	TotalMatches int     `json:"total_matches"`
+	Truncated    bool    `json:"truncated"`
 	// NextCue is set when Truncated: pass it back as StartCue to continue.
 	NextCue   *int       `json:"next_cue,omitempty"`
 	MatchMode string     `json:"match_mode,omitempty"`
@@ -57,11 +62,12 @@ type SearchResult struct {
 }
 
 const (
-	defaultContextCues = 1
-	maxContextCues     = 10
-	defaultMaxMatches  = 10
-	maxMatchesLimit    = 50
-	maxContextLen      = 2000 // runes
+	DefaultContextCues = 1
+	DefaultMaxMatches  = 10
+	MaxMatchesLimit    = 50
+
+	maxContextCues = 10
+	maxContextLen  = 2000 // runes
 	// searchWindowCues tolerates auto-caption splitting: a phrase like
 	// "unknown unknowns" is often two adjacent cues, and an AND over a single
 	// cue would report a false negative.
@@ -77,7 +83,9 @@ var searchReplacer = strings.NewReplacer(
 	"–", " ", "—", " ", "-", " ",
 )
 
-func normalizeSearchText(s string) string {
+// NormalizeText lowercases and normalizes typography for matching and for
+// advisory content checks.
+func NormalizeText(s string) string {
 	return strings.ToLower(searchReplacer.Replace(s))
 }
 
@@ -86,7 +94,7 @@ func normalizeSearchText(s string) string {
 // matching each letter turns the query into noise.
 func queryTerms(q string) []string {
 	var out []string
-	for _, t := range strings.Fields(normalizeSearchText(q)) {
+	for _, t := range strings.Fields(NormalizeText(q)) {
 		t = strings.Trim(t, ".,!?;:\"'()[]{}<>")
 		if t != "" {
 			out = append(out, t)
@@ -167,37 +175,38 @@ func phraseIn(haystack, phrase string) bool {
 	return strings.Contains(" "+normalizePhrase(haystack)+" ", " "+phrase+" ")
 }
 
-func normalizeMatchMode(m MatchMode) MatchMode {
-	mode, _ := parseMatchMode(string(m))
+func normalizeMatchMode(m Mode) Mode {
+	mode, _ := ParseMode(string(m))
 	return mode
 }
 
-// parseMatchMode reports whether the caller supplied a known mode, so a typo
-// fails loudly instead of silently scanning with the default.
-func parseMatchMode(s string) (MatchMode, bool) {
+// ParseMode reports whether the caller supplied a known mode, so a typo fails
+// loudly instead of silently scanning with the default.
+func ParseMode(s string) (Mode, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "all":
-		return MatchAll, true
+		return All, true
 	case "any":
-		return MatchAny, true
+		return Any, true
 	case "phrase":
-		return MatchPhrase, true
+		return Phrase, true
 	default:
-		return MatchAll, false
+		return All, false
 	}
 }
 
-func searchSegments(segs []Segment, opts SearchOptions) SearchResult {
+// Segments searches a transcript's cues.
+func Segments(segs []transcript.Segment, opts Options) Result {
 	mode := normalizeMatchMode(opts.MatchMode)
 	terms := queryTerms(opts.Query)
 	if len(terms) == 0 {
-		return SearchResult{Matches: []SearchMatch{}, MatchMode: string(mode)}
+		return Result{Matches: []Match{}, MatchMode: string(mode)}
 	}
 	if opts.MaxMatches <= 0 {
-		opts.MaxMatches = defaultMaxMatches
+		opts.MaxMatches = DefaultMaxMatches
 	}
-	if opts.MaxMatches > maxMatchesLimit {
-		opts.MaxMatches = maxMatchesLimit
+	if opts.MaxMatches > MaxMatchesLimit {
+		opts.MaxMatches = MaxMatchesLimit
 	}
 	ctx := opts.ContextCues
 	if ctx < 0 {
@@ -209,7 +218,7 @@ func searchSegments(segs []Segment, opts SearchOptions) SearchResult {
 
 	norm := make([]string, len(segs))
 	for i, s := range segs {
-		norm[i] = normalizeSearchText(s.Text)
+		norm[i] = NormalizeText(s.Text)
 	}
 
 	// Statistics cover the whole transcript, not the requested slice, so
@@ -228,14 +237,14 @@ func searchSegments(segs []Segment, opts SearchOptions) SearchResult {
 
 	matchCue := func(i int) bool {
 		switch mode {
-		case MatchAny:
+		case Any:
 			for _, term := range terms {
 				if containsTerm(norm[i], term) {
 					return true
 				}
 			}
 			return false
-		case MatchPhrase:
+		case Phrase:
 			return phraseIn(segs[i].Text, phrase)
 		default:
 			return allTermsIn(norm[i], terms)
@@ -248,7 +257,7 @@ func searchSegments(segs []Segment, opts SearchOptions) SearchResult {
 	}
 
 	windowMatches := func(from, to int) bool {
-		if mode == MatchPhrase {
+		if mode == Phrase {
 			return phraseIn(joinCueText(segs, from, to), phrase)
 		}
 		var w strings.Builder
@@ -259,9 +268,9 @@ func searchSegments(segs []Segment, opts SearchOptions) SearchResult {
 		return allTermsIn(w.String(), terms)
 	}
 
-	needsWindow := mode == MatchPhrase || (mode == MatchAll && len(terms) > 1)
+	needsWindow := mode == Phrase || (mode == All && len(terms) > 1)
 
-	res := SearchResult{Matches: []SearchMatch{}, MatchMode: string(mode), Terms: stats}
+	res := Result{Matches: []Match{}, MatchMode: string(mode), Terms: stats}
 	nextAfter := 0
 	consider := func(anchor, spanStart, spanEnd int) {
 		res.TotalMatches++
@@ -269,15 +278,15 @@ func searchSegments(segs []Segment, opts SearchOptions) SearchResult {
 			res.Truncated = true
 			return
 		}
-		m := SearchMatch{
+		m := Match{
 			CueIndex:     anchor,
 			StartSeconds: segs[anchor].Start,
-			Timestamp:    tsShort(segs[anchor].Start),
+			Timestamp:    transcript.Timestamp(segs[anchor].Start),
 		}
 		if spanEnd == spanStart+1 {
 			m.Text = segs[anchor].Text
 		} else {
-			text, _ := truncateRunes(joinCueText(segs, spanStart, spanEnd), maxWindowTextRunes)
+			text, _ := transcript.TruncateRunes(joinCueText(segs, spanStart, spanEnd), maxWindowTextRunes)
 			m.Text = text
 		}
 		if ctx > 0 {
@@ -355,19 +364,19 @@ func searchSegments(segs []Segment, opts SearchOptions) SearchResult {
 			res.Notes = append(res.Notes, "not found in transcript: "+strings.Join(missing, ", ")+
 				" (auto-captions may spell names differently)")
 		}
-		if mode == MatchAll && len(terms) > 1 && len(missing) == 0 {
+		if mode == All && len(terms) > 1 && len(missing) == 0 {
 			res.Notes = append(res.Notes, fmt.Sprintf(
 				"the %d terms never co-occur within %d cues; retry with match_mode=any",
 				len(terms), searchWindowCues))
 		}
-		if mode == MatchPhrase && len(missing) == 0 {
+		if mode == Phrase && len(missing) == 0 {
 			res.Notes = append(res.Notes, "phrase mode needs adjacent words; retry with match_mode=all or any for paraphrases")
 		}
 	}
 	return res
 }
 
-func joinCueText(segs []Segment, from, to int) string {
+func joinCueText(segs []transcript.Segment, from, to int) string {
 	var parts []string
 	for i := from; i < to && i < len(segs); i++ {
 		parts = append(parts, segs[i].Text)
@@ -375,7 +384,7 @@ func joinCueText(segs []Segment, from, to int) string {
 	return strings.Join(parts, " ")
 }
 
-func joinContext(segs []Segment, from, to int) string {
+func joinContext(segs []transcript.Segment, from, to int) string {
 	if from < 0 {
 		from = 0
 	}
@@ -386,6 +395,6 @@ func joinContext(segs []Segment, from, to int) string {
 		return ""
 	}
 	joined := joinCueText(segs, from, to)
-	out, _ := truncateRunes(joined, maxContextLen)
+	out, _ := transcript.TruncateRunes(joined, maxContextLen)
 	return out
 }

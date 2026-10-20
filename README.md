@@ -25,13 +25,34 @@ Dependencies: `cobra` (CLI), `modelcontextprotocol/go-sdk` (official MCP SDK),
 and `golang.org/x/term` (TTY detection). The YouTube fetch layer is stdlib only
 — `net/http`, `encoding/json`, `encoding/xml`.
 
+## Layout
+
+```
+cmd/yt/           binary entry point
+internal/cli/     cobra commands and flags
+internal/mcp/     MCP tool schemas, handlers, safety warnings
+internal/youtube/ Innertube client, captions, channels, cache, typed failures
+internal/search/  pure transcript search
+internal/render/  block/cue rendering, SRT, truncation metadata
+internal/transcript/ shared Segment/Transcript model and timestamp helpers
+internal/apperr/  typed error contract (code, retryable, suggestion)
+```
+
+Dependencies point inward: `cli` and `mcp` depend on `youtube`, `search`,
+`render`, and `transcript`; `youtube` depends on `apperr` and `transcript`;
+`search` and `render` depend only on `transcript`. The acquisition layer does
+not import the adapters.
+
 ## Install
 
 ```sh
-go build -o yt . && cp yt /opt/homebrew/bin/yt   # or any dir on PATH
+go build -o yt ./cmd/yt && cp yt /opt/homebrew/bin/yt   # or any dir on PATH
 # Replace (rm+cp), don't overwrite a running binary in place:
 #   cp over a mapped executable makes macOS SIGKILL the next exec.
 ```
+
+`go install ./cmd/yt` also works. The module path is the local `yt`; change it
+to a hosted path first if you need to import these packages from another module.
 
 ## CLI
 

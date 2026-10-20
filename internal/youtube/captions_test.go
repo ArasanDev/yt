@@ -1,9 +1,10 @@
-package main
+package youtube
 
 import (
 	"net/url"
-	"strings"
 	"testing"
+
+	"yt/internal/apperr"
 )
 
 func TestExtractVideoID(t *testing.T) {
@@ -15,17 +16,17 @@ func TestExtractVideoID(t *testing.T) {
 		"https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=10": "dQw4w9WgXcQ",
 	}
 	for in, want := range cases {
-		got, err := extractVideoID(in)
+		got, err := ExtractVideoID(in)
 		if err != nil {
-			t.Fatalf("extractVideoID(%q): %v", in, err)
+			t.Fatalf("ExtractVideoID(%q): %v", in, err)
 		}
 		if got != want {
-			t.Errorf("extractVideoID(%q) = %q, want %q", in, got, want)
+			t.Errorf("ExtractVideoID(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if _, err := extractVideoID("not a video"); err == nil {
+	if _, err := ExtractVideoID("not a video"); err == nil {
 		t.Fatal("expected error for invalid input")
-	} else if te, ok := toolErrorOf(err); !ok || te.Code != CodeInvalidID {
+	} else if te, ok := apperr.As(err); !ok || te.Code != apperr.CodeInvalidID {
 		t.Fatalf("want invalid_id, got %v", err)
 	}
 }
@@ -101,8 +102,8 @@ func TestPickTrack(t *testing.T) {
 	}
 
 	_, _, _, err = pickTrack(tracks, []string{"fr"}, false)
-	te, ok := toolErrorOf(err)
-	if !ok || te.Code != CodeNoMatchingLang {
+	te, ok := apperr.As(err)
+	if !ok || te.Code != apperr.CodeNoMatchingLang {
 		t.Fatalf("want no_matching_language, got %v", err)
 	}
 	if len(te.AvailableLanguages) != 2 {
@@ -172,23 +173,6 @@ func TestPickTrackHonoursSentinelPosition(t *testing.T) {
 	got, translated, _, err := pickTrack(tracks, []string{"en", OriginalLanguageValue}, true)
 	if err != nil || translated || got.LanguageCode != "en" {
 		t.Fatalf("first requested language must win: %+v translated=%v err=%v", got, translated, err)
-	}
-}
-
-func TestTruncateRunes(t *testing.T) {
-	s := "héllo wörld"
-	got, truncated := truncateRunes(s, 5)
-	if !truncated {
-		t.Fatal("expected truncation")
-	}
-	if !strings.HasPrefix(got, "héllo") || !strings.HasSuffix(got, "…") {
-		t.Errorf("rune-unsafe truncation: %q", got)
-	}
-	if full, tr := truncateRunes(s, 0); tr || full != s {
-		t.Errorf("limit 0 should mean no truncation, got %q truncated=%v", full, tr)
-	}
-	if _, tr := truncateRunes(s, 100); tr {
-		t.Error("short string should not be truncated")
 	}
 }
 

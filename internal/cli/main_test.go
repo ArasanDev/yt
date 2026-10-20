@@ -1,9 +1,11 @@
-package main
+package cli
 
 import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"yt/internal/youtube"
 )
 
 // Bare `yt` at an interactive prompt must print help, not start an MCP server
@@ -13,7 +15,7 @@ func TestRootNoArgsWithTTYShowsHelp(t *testing.T) {
 	t.Cleanup(func() { stdinIsTerminal = orig })
 	stdinIsTerminal = func() bool { return true }
 
-	root := newRootCmd()
+	root := NewRootCmd(youtube.NewClient())
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -32,7 +34,7 @@ func TestRootNoArgsWithTTYShowsHelp(t *testing.T) {
 
 // The explicit subcommand must keep working; the no-args default is additive.
 func TestMCPSubcommandRemainsExplicit(t *testing.T) {
-	cmd, _, err := newRootCmd().Find([]string{"mcp"})
+	cmd, _, err := NewRootCmd(youtube.NewClient()).Find([]string{"mcp"})
 	if err != nil {
 		t.Fatalf("Find(mcp): %v", err)
 	}

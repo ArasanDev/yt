@@ -1,6 +1,9 @@
-package main
+package youtube
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestParseChapters(t *testing.T) {
 	desc := "Blurb about the episode.\n\nChapters:\n00:00 Opening\n01:30 - The problem\n1:02:03 Later\n\nLinks:\nhttps://example.com\n"
@@ -59,5 +62,25 @@ func TestParseChaptersAllowsBlankLinesBetweenEntries(t *testing.T) {
 	desc := "Chapters:\n00:00 Intro\n\n00:10 Body\n\n00:20 End\n\nLinks:\nhttps://example.com\n"
 	if got := parseChapters(desc, 100); len(got) != 3 {
 		t.Fatalf("want 3 chapters across blank lines, got %+v", got)
+	}
+}
+
+func TestInfoParsesChaptersPastDescriptionCutoff(t *testing.T) {
+	f, cleanup := newFakeYouTube(t)
+	defer cleanup()
+	f.description = "Blurb.\n\nChapters:\n00:00 Opening\n00:10 Middle\n00:20 End\n\nLinks:\nhttps://example.com\n"
+
+	info, err := f.client.Info(context.Background(), "testvideo01", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Chapters) != 3 {
+		t.Fatalf("want 3 chapters even when the description is truncated, got %+v", info.Chapters)
+	}
+	if info.Chapters[1].StartSeconds != 10 || info.Chapters[1].Title != "Middle" {
+		t.Errorf("chapter 1 = %+v", info.Chapters[1])
+	}
+	if !info.DescriptionTruncated {
+		t.Error("description should still be truncated for the payload")
 	}
 }

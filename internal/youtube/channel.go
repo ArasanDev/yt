@@ -4,7 +4,7 @@
 // RSS is the backbone because it carries exact publish timestamps. The richer
 // `browse` grid also has duration and views but only relative times ("1 hour
 // ago"), which cannot serve as a watermark for "what changed since last check".
-package main
+package youtube
 
 import (
 	"context"
@@ -17,24 +17,23 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"yt/internal/apperr"
+	"yt/internal/transcript"
 )
 
 const (
 	// feedMaxEntries is what YouTube's channel RSS exposes; there is no way to
 	// ask for more without switching to the (relative-timestamp) browse API.
 	feedMaxEntries      = 15
-	defaultChannelLimit = 10
-	defaultSummaryChars = 200
+	DefaultChannelLimit = 10
+	DefaultSummaryChars = 200
 
 	channelIDTTL   = 24 * time.Hour
 	channelFeedTTL = 5 * time.Minute
 )
 
-var (
-	resolveChannelURL = "https://www.youtube.com/youtubei/v1/navigation/resolve_url?prettyPrint=false"
-	channelFeedURL    = "https://www.youtube.com/feeds/videos.xml?channel_id="
-	handlePattern     = regexp.MustCompile(`^[A-Za-z0-9._-]{2,100}$`)
-)
+var handlePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{2,100}$`)
 
 // Non-channel paths on youtube.com; passing one of these is a user mistake
 // worth naming, not a resolution failure.
@@ -124,8 +123,8 @@ func isChannelID(s string) bool {
 	return true
 }
 
-func notAChannel(what string) *ToolError {
-	te := newToolError(CodeNotAChannel, "That is a %s, not a channel.", what)
+func notAChannel(what string) *apperr.Error {
+	te := apperr.New(apperr.CodeNotAChannel, "That is a %s, not a channel.", what)
 	te.Suggestion = "Pass a channel handle (@name), a channel URL (youtube.com/@name or /channel/UC…), or a bare UC… channel id."
 	return te
 }
@@ -136,7 +135,7 @@ func notAChannel(what string) *ToolError {
 func parseChannelRef(input string) (channelRef, error) {
 	s := strings.TrimSpace(input)
 	if s == "" {
-		return channelRef{}, newToolError(CodeBadRequest, "channel is required")
+		return channelRef{}, apperr.New(apperr.CodeBadRequest, "channel is required")
 	}
 	if isChannelID(s) {
 		return channelRef{id: s}, nil
@@ -231,9 +230,9 @@ func (c *Client) resolveChannel(ctx context.Context, ref channelRef) (id, handle
 		"url":     ref.url,
 	})
 	if err != nil {
-		return "", "", newToolError(CodeInternal, "could not encode channel resolve request: %v", err)
+		return "", "", apperr.New(apperr.CodeInternal, "could not encode channel resolve request: %v", err)
 	}
-	resp, err := requestWithRetry(ctx, http.MethodPost, resolveChannelURL, body, map[string]string{
+	resp, err := c.requestWithRetry(ctx, http.MethodPost, c.cfg.ResolveURL, body, map[string]string{
 		"Content-Type": "application/json",
 		"User-Agent":   cc.UA,
 	})
@@ -252,7 +251,7 @@ func (c *Client) resolveChannel(ctx context.Context, ref channelRef) (id, handle
 		} `json:"endpoint"`
 	}
 	if err := json.Unmarshal(raw, &rr); err != nil {
-		te := newToolError(CodeUpstreamChanged, "channel resolve response was not parsable JSON: %v", err)
+		te := apperr.New(apperr.CodeUpstreamChanged, "channel resolve response was not parsable JSON: %v", err)
 		te.Suggestion = "Retry once; if it persists, YouTube may have changed the endpoint."
 		return "", "", te
 	}
@@ -262,7 +261,7 @@ func (c *Client) resolveChannel(ctx context.Context, ref channelRef) (id, handle
 		if shown == "" {
 			shown = ref.url
 		}
-		te := newToolError(CodeChannelNotFound, "No YouTube channel matches %q.", shown)
+		te := apperr.New(apperr.CodeChannelNotFound, "No YouTube channel matches %q.", shown)
 		te.Suggestion = "Check the handle spelling, or pass the channel URL from a browser."
 		return "", "", te
 	}
@@ -278,7 +277,7 @@ func (c *Client) channelFeed(ctx context.Context, id string) (*rssFeed, error) {
 	if v, ok := c.memo.Get(key); ok {
 		return v.(*rssFeed), nil
 	}
-	resp, err := requestWithRetry(ctx, http.MethodGet, channelFeedURL+url.QueryEscape(id), nil, map[string]string{
+	resp, err := c.requestWithRetry(ctx, http.MethodGet, c.cfg.FeedURL+url.QueryEscape(id), nil, map[string]string{
 		"User-Agent":      browserUA,
 		"Accept":          "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
 		"Accept-Language": "en-US,en;q=0.9",
@@ -288,8 +287,8 @@ func (c *Client) channelFeed(ctx context.Context, id string) (*rssFeed, error) {
 	}
 	raw, err := readBody(resp, 4<<20)
 	if err != nil {
-		if te, ok := toolErrorOf(err); ok && te.Code == CodeNotFound {
-			te = newToolError(CodeChannelNotFound, "No YouTube channel or feed exists for id %s.", id)
+		if te, ok := apperr.As(err); ok && te.Code == apperr.CodeNotFound {
+			te = apperr.New(apperr.CodeChannelNotFound, "No YouTube channel or feed exists for id %s.", id)
 			te.Suggestion = "Check the handle or channel URL."
 			return nil, te
 		}
@@ -297,7 +296,7 @@ func (c *Client) channelFeed(ctx context.Context, id string) (*rssFeed, error) {
 	}
 	var f rssFeed
 	if err := xml.Unmarshal(raw, &f); err != nil {
-		te := newToolError(CodeUpstreamChanged, "channel feed for %s was not parsable XML: %v", id, err)
+		te := apperr.New(apperr.CodeUpstreamChanged, "channel feed for %s was not parsable XML: %v", id, err)
 		te.Suggestion = "Retry once; YouTube may have changed the feed format."
 		return nil, te
 	}
@@ -312,7 +311,7 @@ func (c *Client) Channel(ctx context.Context, input string, opts ChannelOptions)
 		return nil, err
 	}
 	ref.input = strings.TrimSpace(input)
-	ctx, cancel := context.WithTimeout(ctx, totalDeadline)
+	ctx, cancel := context.WithTimeout(ctx, TotalDeadline)
 	defer cancel()
 	id, handle, err := c.resolveChannel(ctx, ref)
 	if err != nil {
@@ -368,7 +367,7 @@ func buildChannelListing(id, handle string, feed *rssFeed, opts ChannelOptions) 
 			URL:       "https://www.youtube.com/watch?v=" + e.VideoID,
 		}
 		if opts.SummaryChars > 0 {
-			v.Summary, _ = truncateRunes(cleanText(e.Group.Description), opts.SummaryChars)
+			v.Summary, _ = transcript.TruncateRunes(cleanText(e.Group.Description), opts.SummaryChars)
 		}
 		entries = append(entries, entry{video: v, published: t})
 	}
@@ -416,15 +415,15 @@ func buildChannelListing(id, handle string, feed *rssFeed, opts ChannelOptions) 
 
 func cleanText(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-// parseSince accepts RFC3339 or a bare date (UTC midnight).
-func parseSince(s string) (time.Time, error) {
+// ParseSince accepts RFC3339 or a bare date (UTC midnight).
+func ParseSince(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC(), nil
 		}
 	}
-	te := newToolError(CodeBadRequest, "invalid since %q", s)
+	te := apperr.New(apperr.CodeBadRequest, "invalid since %q", s)
 	te.Suggestion = "Use RFC3339 (2026-10-01T00:00:00Z) or a date (2026-10-01); times are UTC."
 	return time.Time{}, te
 }
