@@ -1,7 +1,0 @@
-yt
-.venv/
-__pycache__/
-*.egg-info/
-dist/
-.pytest_cache/
-.devin/mcp_config.local.json

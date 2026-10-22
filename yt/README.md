@@ -27,15 +27,19 @@ and `golang.org/x/term` (TTY detection). The YouTube fetch layer is stdlib only
 
 ## Layout
 
+The repository root keeps only the product folder and repository metadata
+(`.git`, `.devin`). Everything else lives here.
+
 ```
-cmd/yt/           binary entry point
-internal/cli/     cobra commands and flags
-internal/mcp/     MCP tool schemas, handlers, safety warnings
-internal/youtube/ Innertube client, captions, channels, cache, typed failures
-internal/search/  pure transcript search
-internal/render/  block/cue rendering, SRT, truncation metadata
-internal/transcript/ shared Segment/Transcript model and timestamp helpers
-internal/apperr/  typed error contract (code, retryable, suggestion)
+yt/                  module and product root
+  cmd/yt/            binary entry point
+  internal/cli/      cobra commands and flags
+  internal/mcp/      MCP tool schemas, handlers, safety warnings
+  internal/youtube/  Innertube client, captions, channels, cache, typed failures
+  internal/search/   pure transcript search
+  internal/render/   block/cue rendering, SRT, truncation metadata
+  internal/transcript/ shared Segment/Transcript model and timestamp helpers
+  internal/apperr/   typed error contract (code, retryable, suggestion)
 ```
 
 Dependencies point inward: `cli` and `mcp` depend on `youtube`, `search`,
@@ -45,14 +49,19 @@ not import the adapters.
 
 ## Install
 
+From the repository root:
+
 ```sh
-go build -o yt ./cmd/yt && cp yt /opt/homebrew/bin/yt   # or any dir on PATH
+cd yt
+go build -o bin/yt ./cmd/yt
+rm -f /opt/homebrew/bin/yt && cp bin/yt /opt/homebrew/bin/yt  # or any dir on PATH
 # Replace (rm+cp), don't overwrite a running binary in place:
 #   cp over a mapped executable makes macOS SIGKILL the next exec.
 ```
 
-`go install ./cmd/yt` also works. The module path is the local `yt`; change it
-to a hosted path first if you need to import these packages from another module.
+`go install ./cmd/yt` also works from `yt/`. The module path is the local `yt`;
+change it to a hosted path first if you need to import these packages from
+another module.
 
 ## CLI
 
@@ -158,9 +167,3 @@ or raw `mcpServers` JSON (Devin, Claude Desktop, Cursor, Windsurf, …):
 - `warnings` is advisory. It flags instruction-shaped caption text (e.g. "ignore
   previous instructions") so a caller can quote rather than obey. Captions remain
   `content_trust: "untrusted"` regardless.
-
-## python/
-
-Earlier Python prototype (`youtube-transcript-api` + optional faster-whisper
-fallback for uncaptioned videos). Kept for the whisper path; the Go binary is
-the primary tool.
