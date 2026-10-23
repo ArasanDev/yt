@@ -28,7 +28,8 @@ type Options struct {
 	EndSeconds    float64 // 0 = to end
 	StartCue      int
 	MaxCues       int
-	MaxChars      int // 0 = unlimited; bounds the body only
+	MaxChars      int  // 0 = unlimited; bounds the body only
+	Bare          bool // text only: omit the metadata header and truncation trailer
 }
 
 // Rendered is the text rendering plus its truncation metadata.
@@ -109,7 +110,11 @@ func normalizeTimestampMode(m string, legacyTimestamps bool) (string, []string) 
 	}
 }
 
-func selectSegments(segs []transcript.Segment, opts Options) []idxSeg {
+// selectSegments returns the cue slice for the requested range. cappedNext is
+// non-nil exactly when MaxCues cut cues out of the requested range (not just
+// the end of the transcript); it points at the index of the first excluded
+// cue, which resumes correctly via StartCue or StartSeconds.
+func selectSegments(segs []transcript.Segment, opts Options) (sel []idxSeg, cappedNext *int) {
 	start := 0
 	if opts.StartCue > 0 {
 		start = opts.StartCue
@@ -136,18 +141,20 @@ func selectSegments(segs []transcript.Segment, opts Options) []idxSeg {
 	}
 	if opts.MaxCues > 0 && start+opts.MaxCues < end {
 		end = start + opts.MaxCues
+		i := end
+		cappedNext = &i
 	}
 	out := make([]idxSeg, 0, end-start)
 	for i := start; i < end; i++ {
 		out = append(out, idxSeg{i: i, seg: segs[i]})
 	}
-	return out
+	return out, cappedNext
 }
 
 // Select returns the raw segments in the requested range. It is used by SRT
 // output, where the rendered text blocks are not wanted.
 func Select(segs []transcript.Segment, opts Options) []transcript.Segment {
-	sel := selectSegments(segs, opts)
+	sel, _ := selectSegments(segs, opts)
 	out := make([]transcript.Segment, 0, len(sel))
 	for _, s := range sel {
 		out = append(out, s.seg)
@@ -244,12 +251,12 @@ func Render(t *transcript.Transcript, durationSeconds int, opts Options) Rendere
 		TotalChars:    canonicalChars(t.Segments),
 		Words:         transcript.WordCount(t.Segments),
 	}
-	blocks := buildBlocks(selectSegments(t.Segments, opts), gran)
+	sel, cappedNext := selectSegments(t.Segments, opts)
+	blocks := buildBlocks(sel, gran)
 
 	var body strings.Builder
 	nextStamp := 0.0
 	var lastEnd float64
-	lastIdx := -1
 	budget := 0
 	for _, blk := range blocks {
 		line := renderLine(blk, mode, &nextStamp)
@@ -271,7 +278,6 @@ func Render(t *transcript.Transcript, durationSeconds int, opts Options) Rendere
 		lastEnd = blk.End
 		r.ReturnedCues += blk.CueCount
 		r.ReturnedWords += len(strings.Fields(blk.Text))
-		lastIdx = blk.FirstCue + blk.CueCount - 1
 	}
 
 	if r.ReturnedCues == 0 {
@@ -282,12 +288,14 @@ func Render(t *transcript.Transcript, durationSeconds int, opts Options) Rendere
 		r.EndSeconds = lastEnd
 	}
 
-	// max_cues is also a truncation: more cues exist and the agent must be told,
-	// otherwise it presents its own cap as the end of the video.
-	if !r.Truncated && opts.MaxCues > 0 && opts.EndSeconds <= 0 && lastIdx >= 0 && lastIdx+1 < len(t.Segments) {
+	// max_cues is also a truncation: more cues remain in the requested range
+	// (possibly bounded by end_seconds, not just the transcript end) and the
+	// agent must be told, otherwise it presents its own cap as the end of the
+	// video.
+	if !r.Truncated && cappedNext != nil && len(sel) > 0 {
 		r.Truncated = true
-		ns := t.Segments[lastIdx+1].Start
-		nc := lastIdx + 1
+		ns := t.Segments[*cappedNext].Start
+		nc := *cappedNext
 		r.NextStartSeconds = &ns
 		r.NextCueIndex = &nc
 	}
@@ -303,17 +311,24 @@ func Render(t *transcript.Transcript, durationSeconds int, opts Options) Rendere
 			formatSeconds(*r.NextStartSeconds), *r.NextCueIndex)
 	}
 
+	bodyText := strings.TrimRight(body.String(), "\n")
+	r.ReturnedChars = utf8.RuneCountInString(bodyText)
+	if opts.Bare {
+		// The caller opted out of the header and trailer. Truncation metadata
+		// stays on the struct so the calling surface can still report it (the
+		// CLI writes it to stderr and never leaves a bare result silently cut).
+		r.Text = bodyText
+		return r
+	}
 	var out strings.Builder
 	out.WriteString(header)
 	out.WriteString("\n\n")
-	bodyText := strings.TrimRight(body.String(), "\n")
 	out.WriteString(bodyText)
 	if r.Truncated && r.NextStartSeconds != nil && r.NextCueIndex != nil {
 		fmt.Fprintf(&out, "\n\n[... truncated at %s of %s — continue with start_seconds=%s or start_cue=%d ...]",
 			transcript.Timestamp(r.EndSeconds), transcript.Timestamp(float64(durationSeconds)), formatSeconds(*r.NextStartSeconds), *r.NextCueIndex)
 	}
 	r.Text = out.String()
-	r.ReturnedChars = utf8.RuneCountInString(bodyText)
 	return r
 }
 
@@ -323,7 +338,7 @@ func formatSeconds(f float64) string {
 
 // SelectForJSON returns the cue-level counterpart of Render.
 func SelectForJSON(segs []transcript.Segment, durationSeconds int, opts Options) JSONSelection {
-	sel := selectSegments(segs, opts)
+	sel, cappedNext := selectSegments(segs, opts)
 	res := JSONSelection{TotalChars: canonicalChars(segs)}
 	chars := 0
 	for _, s := range sel {
@@ -343,15 +358,14 @@ func SelectForJSON(segs []transcript.Segment, durationSeconds int, opts Options)
 	res.ReturnedCues = len(res.Segments)
 	res.ReturnedChars = chars
 
-	if !res.Truncated && opts.MaxCues > 0 && opts.EndSeconds <= 0 && len(sel) > 0 {
-		last := sel[len(sel)-1].i
-		if last+1 < len(segs) {
-			res.Truncated = true
-			ns := segs[last+1].Start
-			nc := last + 1
-			res.NextStartSeconds = &ns
-			res.NextCueIndex = &nc
-		}
+	// Same rule as Render: a MaxCues cap inside the requested range is
+	// truncation, independent of whether end_seconds was given.
+	if !res.Truncated && cappedNext != nil && len(sel) > 0 {
+		res.Truncated = true
+		ns := segs[*cappedNext].Start
+		nc := *cappedNext
+		res.NextStartSeconds = &ns
+		res.NextCueIndex = &nc
 	}
 
 	start := opts.StartSeconds

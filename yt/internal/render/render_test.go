@@ -151,6 +151,139 @@ func TestMaxCuesReportsContinuation(t *testing.T) {
 	}
 }
 
+// Regression: MaxCues inside an end_seconds window used to be a silent cut
+// because truncation reporting was gated on EndSeconds <= 0. The cap must be
+// reported with exact pointers regardless of the time window, and a cap that
+// swallows the whole window must NOT be reported as truncation.
+func TestMaxCuesInsideTimeRange(t *testing.T) {
+	tr := testTranscript() // 40 cues, one per second
+	tests := []struct {
+		name        string
+		opts        Options
+		wantCues    int
+		wantNextCue int
+		wantNextSec float64
+	}{
+		{
+			name:        "text: cap cuts inside the window",
+			opts:        Options{Granularity: "cue", TimestampMode: "cue", StartSeconds: 10, EndSeconds: 20, MaxCues: 5},
+			wantCues:    5,
+			wantNextCue: 15,
+			wantNextSec: 15,
+		},
+		{
+			name:        "text: block granularity, cap from the start",
+			opts:        Options{MaxCues: 2, EndSeconds: 20},
+			wantCues:    2,
+			wantNextCue: 2,
+			wantNextSec: 2,
+		},
+		{
+			name:        "text: cap larger than the window is not truncation",
+			opts:        Options{Granularity: "cue", TimestampMode: "cue", StartSeconds: 10, EndSeconds: 20, MaxCues: 100},
+			wantCues:    10,
+			wantNextCue: -1,
+			wantNextSec: -1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Render(tr, 40, tc.opts)
+			if r.ReturnedCues != tc.wantCues {
+				t.Fatalf("returned cues: want %d, got %d", tc.wantCues, r.ReturnedCues)
+			}
+			if tc.wantNextCue < 0 {
+				if r.Truncated {
+					t.Fatal("a cap that swallows the whole window is not truncation")
+				}
+				return
+			}
+			if !strings.Contains(r.Text, "TRUNCATED") {
+				t.Fatalf("text must carry the TRUNCATED header: %q", r.Text)
+			}
+			if r.NextCueIndex == nil || *r.NextCueIndex != tc.wantNextCue {
+				t.Fatalf("next_cue_index: want %d, got %+v", tc.wantNextCue, r.NextCueIndex)
+			}
+			if r.NextStartSeconds == nil || *r.NextStartSeconds != tc.wantNextSec {
+				t.Fatalf("next_start_seconds: want %v, got %+v", tc.wantNextSec, r.NextStartSeconds)
+			}
+			// Resuming from the pointer must land inside the same window and
+			// keep the cues consistent.
+			if tc.wantNextCue >= 0 {
+				rest := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue",
+					StartSeconds: *r.NextStartSeconds, EndSeconds: tc.opts.EndSeconds})
+				if rest.ReturnedCues == 0 {
+					t.Fatal("resuming at the pointer returned nothing inside the window")
+				}
+			}
+		})
+	}
+}
+
+func TestMaxCuesInsideTimeRangeJSON(t *testing.T) {
+	tr := testTranscript()
+	tests := []struct {
+		name        string
+		opts        Options
+		wantCues    int
+		wantNextCue int
+		wantNextSec float64
+	}{
+		{
+			name:        "json: cap cuts inside the window",
+			opts:        Options{StartSeconds: 10, EndSeconds: 20, MaxCues: 5},
+			wantCues:    5,
+			wantNextCue: 15,
+			wantNextSec: 15,
+		},
+		{
+			name:        "json: cap exactly fills the window",
+			opts:        Options{EndSeconds: 3, MaxCues: 100},
+			wantCues:    3,
+			wantNextCue: -1,
+			wantNextSec: -1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := SelectForJSON(tr.Segments, 40, tc.opts)
+			if len(js.Segments) != tc.wantCues {
+				t.Fatalf("segments: want %d, got %d", tc.wantCues, len(js.Segments))
+			}
+			if js.Truncated != (tc.wantNextCue >= 0) {
+				t.Fatalf("truncated: want %v, got %v", tc.wantNextCue >= 0, js.Truncated)
+			}
+			if tc.wantNextCue < 0 {
+				return
+			}
+			if js.NextCueIndex == nil || *js.NextCueIndex != tc.wantNextCue {
+				t.Fatalf("next_cue_index: want %d, got %+v", tc.wantNextCue, js.NextCueIndex)
+			}
+			if js.NextStartSeconds == nil || *js.NextStartSeconds != tc.wantNextSec {
+				t.Fatalf("next_start_seconds: want %v, got %+v", tc.wantNextSec, js.NextStartSeconds)
+			}
+		})
+	}
+}
+
+// Bare mode is the pipe-clean surface: no header, no trailer, but the
+// structured truncation metadata must remain available for the caller.
+func TestRenderBare(t *testing.T) {
+	tr := testTranscript()
+	r := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue", MaxCues: 5, Bare: true})
+	if strings.Contains(r.Text, "# transcript") || strings.Contains(r.Text, "TRUNCATED") {
+		t.Fatalf("bare text must be body-only, got %q", r.Text)
+	}
+	if !r.Truncated || r.NextCueIndex == nil || *r.NextCueIndex != 5 {
+		t.Fatalf("bare mode must keep the truncation metadata, got %+v", r)
+	}
+	full := Render(tr, 40, Options{Granularity: "cue", TimestampMode: "cue", MaxCues: 5})
+	after := full.Text[strings.Index(full.Text, "\n\n")+2:]
+	if !strings.HasPrefix(after, r.Text) {
+		t.Error("the full rendering's body must match bare body")
+	}
+}
+
 func TestRenderEmptyRangeIsFlagged(t *testing.T) {
 	tr := testTranscript()
 	r := Render(tr, 40, Options{Granularity: "cue", StartSeconds: 100})

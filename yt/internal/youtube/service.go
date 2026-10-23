@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"yt/internal/apperr"
@@ -59,6 +60,20 @@ func DefaultConfig() Config {
 type Client struct {
 	memo *Memo
 	cfg  Config
+
+	// inflight coalesces concurrent Player misses for the same video so a
+	// fleet of agents asking about one video costs one upstream fetch.
+	mu       sync.Mutex
+	inflight map[string]*playerCall
+}
+
+// playerCall is one in-flight player acquisition shared by its waiters.
+// The fields are written once, under mu, immediately before done is closed.
+type playerCall struct {
+	done chan struct{}
+	pr   *playerResponse
+	via  string
+	err  error
 }
 
 // NewClient returns a client using the production endpoints.
@@ -83,7 +98,11 @@ func NewClientWithConfig(cfg Config) *Client {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = def.HTTPClient
 	}
-	return &Client{memo: NewMemo(32 << 20), cfg: cfg}
+	return &Client{
+		memo:     NewMemo(32 << 20),
+		cfg:      cfg,
+		inflight: make(map[string]*playerCall),
+	}
 }
 
 type playerCache struct {
@@ -94,21 +113,64 @@ type playerCache struct {
 // Player returns a player response, memoized per video. Negative results
 // (private, not found, no captions) are cached briefly so a probing agent
 // cannot turn the improved error path into a hot loop.
+//
+// Concurrent misses for the same video are coalesced: every caller waits on
+// one upstream fetch, but each still honors its own context deadline. The
+// shared fetch is detached from the first caller's cancellation so an
+// abandoned request cannot fail the others; it keeps its own TotalDeadline.
 func (c *Client) Player(ctx context.Context, videoID string) (*playerResponse, string, error) {
+	// Check positive entries first. A negative entry can be written after a
+	// success (for example by another acquisition path), and a stale failure
+	// must never shadow a newer success.
+	if v, ok := c.memo.Get("player:" + videoID); ok {
+		pv := v.(playerCache)
+		return pv.pr, pv.via, nil
+	}
 	if v, ok := c.memo.Get("neg:" + videoID); ok {
 		if te, ok := v.(*apperr.Error); ok {
 			return nil, "", te
 		}
 	}
-	if v, ok := c.memo.Get("player:" + videoID); ok {
-		pv := v.(playerCache)
-		return pv.pr, pv.via, nil
+	if err := ctx.Err(); err != nil {
+		return nil, "", apperr.ClassifyContext(err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, TotalDeadline)
-	defer cancel()
-	pr, via, err := c.fetchPlayer(ctx, videoID)
+
+	c.mu.Lock()
+	if call, ok := c.inflight[videoID]; ok {
+		c.mu.Unlock()
+		return waitForPlayer(ctx, call)
+	}
+	call := &playerCall{done: make(chan struct{})}
+	c.inflight[videoID] = call
+	c.mu.Unlock()
+
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), TotalDeadline)
+	go func() {
+		defer cancel()
+		pr, via, err := c.fetchPlayer(fetchCtx, videoID)
+		c.storePlayerResult(videoID, pr, via, err)
+		c.mu.Lock()
+		call.pr, call.via, call.err = pr, via, err
+		delete(c.inflight, videoID)
+		close(call.done)
+		c.mu.Unlock()
+	}()
+	return waitForPlayer(ctx, call)
+}
+
+func waitForPlayer(ctx context.Context, call *playerCall) (*playerResponse, string, error) {
+	select {
+	case <-call.done:
+		return call.pr, call.via, call.err
+	case <-ctx.Done():
+		return nil, "", apperr.ClassifyContext(ctx.Err())
+	}
+}
+
+// storePlayerResult applies the memo policy for one completed acquisition.
+func (c *Client) storePlayerResult(videoID string, pr *playerResponse, via string, err error) {
 	if err != nil {
-		if te, ok := apperr.As(err); ok {
+		if te, ok := apperr.As(err); ok && te != nil {
 			switch {
 			case te.Code == apperr.CodeRateLimited:
 				c.memo.Put("neg:"+videoID, te, rateLimitedTTL, 512)
@@ -116,19 +178,18 @@ func (c *Client) Player(ctx context.Context, videoID string) (*playerResponse, s
 				c.memo.Put("neg:"+videoID, te, negativeTTL, 512)
 			}
 		}
-		return nil, "", err
+		return
 	}
 	// A success invalidates any cached failure (e.g. a transient block).
 	c.memo.Delete("neg:" + videoID)
 	ttl := playerTTL
 	switch {
-	case pr.isLive():
+	case pr.isLiveNow():
 		ttl = livePlayerTTL
 	case via == "watch-page":
 		ttl = watchPagePlayerTTL
 	}
 	c.memo.Put("player:"+videoID, playerCache{pr: pr, via: via}, ttl, estimatePlayerSize(pr))
-	return pr, via, nil
 }
 
 // estimatePlayerSize is a conservative charge for a parsed player response:
@@ -162,13 +223,43 @@ func (c *Client) Transcript(ctx context.Context, videoID string, opts Transcript
 		return nil, err
 	}
 	t, err := c.selectAndDownload(ctx, videoID, pr, via, opts)
+	if err != nil && shouldRefreshPlayer(ctx, err) {
+		// Signed caption URLs are short-lived and can come back as a block or
+		// bot check even though the player response itself is fine. Drop the
+		// cached player response and retry once with a freshly signed URL.
+		c.memo.Delete("player:" + videoID)
+		if pr2, via2, perr := c.Player(ctx, videoID); perr == nil {
+			pr, via = pr2, via2
+			t, err = c.selectAndDownload(ctx, videoID, pr, via, opts)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	if !pr.isLive() {
+	// Live streams keep growing; only cache what is already final. Use current
+	// liveness, not the historical isLiveContent flag.
+	if !pr.isLiveNow() {
 		c.memo.Put(key, t, transcriptTTL, transcriptSize(t))
 	}
 	return t, nil
+}
+
+// shouldRefreshPlayer reports whether a caption failure is likely a stale
+// signed URL rather than a verdict on the video. Context exhaustion is never
+// retried: the shared deadline is already spent.
+func shouldRefreshPlayer(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	te, ok := apperr.As(err)
+	if !ok || te == nil {
+		return false
+	}
+	switch te.Code {
+	case apperr.CodeBlocked, apperr.CodeBotCheck:
+		return true
+	}
+	return te.Retryable
 }
 
 type CaptionSummary struct {
@@ -189,6 +280,7 @@ type VideoInfo struct {
 	DurationSeconds           int            `json:"duration_seconds"`
 	ViewCount                 int64          `json:"view_count"`
 	IsLive                    bool           `json:"is_live"`
+	IsLiveContent             bool           `json:"is_live_content"`
 	PublishedAt               string         `json:"published_at,omitempty"`
 	Category                  string         `json:"category,omitempty"`
 	Keywords                  []string       `json:"keywords,omitempty"`
@@ -237,6 +329,11 @@ func (c *Client) Info(ctx context.Context, videoID string, descriptionChars int)
 	if summary.HasCaptions {
 		estimate = duration * 17 // ~17 chars/second observed on real ASR
 	}
+	published := pr.Microformat.Renderer.PublishDate
+	if published == "" {
+		// Some player responses omit publishDate but still carry uploadDate.
+		published = pr.Microformat.Renderer.UploadDate
+	}
 	info := &VideoInfo{
 		OK:                        true,
 		VideoID:                   pr.VideoDetails.VideoID,
@@ -245,8 +342,9 @@ func (c *Client) Info(ctx context.Context, videoID string, descriptionChars int)
 		ChannelID:                 pr.VideoDetails.ChannelID,
 		DurationSeconds:           duration,
 		ViewCount:                 views,
-		IsLive:                    pr.isLive(),
-		PublishedAt:               pr.Microformat.Renderer.PublishDate,
+		IsLive:                    pr.isLiveNow(),
+		IsLiveContent:             pr.wasLive(),
+		PublishedAt:               published,
 		Category:                  pr.Microformat.Renderer.Category,
 		Keywords:                  pr.Microformat.Renderer.Keywords,
 		Description:               desc,

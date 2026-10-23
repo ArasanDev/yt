@@ -9,7 +9,6 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"yt/internal/apperr"
-	"yt/internal/youtube"
 )
 
 func TestMCPInfoHandler(t *testing.T) {
@@ -24,12 +23,19 @@ func TestMCPInfoHandler(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("unexpected tool error: %v", res.Content)
 	}
-	info, ok := res.StructuredContent.(*youtube.VideoInfo)
+	out, ok := res.StructuredContent.(videoInfoOut)
 	if !ok {
-		t.Fatalf("want *youtube.VideoInfo, got %T", res.StructuredContent)
+		t.Fatalf("want videoInfoOut, got %T", res.StructuredContent)
 	}
-	if !info.Captions.HasCaptions {
+	if !out.Captions.HasCaptions {
 		t.Error("caption summary missing")
+	}
+	if out.ContentTrust != "untrusted" {
+		t.Error("video info must be labelled untrusted")
+	}
+	raw := res.Content[0].(*mcpsdk.TextContent).Text
+	if !strings.Contains(raw, `"content_trust":"untrusted"`) {
+		t.Errorf("text block must carry the trust label: %q", raw)
 	}
 }
 
@@ -155,16 +161,23 @@ func TestMCPListChannelVideos(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("unexpected tool error: %v", res.Content)
 	}
-	listing, ok := res.StructuredContent.(*youtube.ChannelListing)
+	out, ok := res.StructuredContent.(channelListingOut)
 	if !ok {
-		t.Fatalf("want *youtube.ChannelListing, got %T", res.StructuredContent)
+		t.Fatalf("want channelListingOut, got %T", res.StructuredContent)
 	}
+	listing := out.ChannelListing
 	if listing.Count != 10 || !listing.Truncated || listing.Available != 12 {
 		t.Fatalf("default limit: count=%d available=%d truncated=%v", listing.Count, listing.Available, listing.Truncated)
+	}
+	if out.ContentTrust != "untrusted" {
+		t.Error("channel listing must be labelled untrusted")
 	}
 	tc, ok := res.Content[0].(*mcpsdk.TextContent)
 	if !ok || tc.Text == "" {
 		t.Fatalf("want a non-empty text block, got %#v", res.Content[0])
+	}
+	if !strings.Contains(tc.Text, `"content_trust":"untrusted"`) {
+		t.Errorf("text block must carry the trust label: %q", tc.Text)
 	}
 
 	// limit=0 means all feed entries.
@@ -173,7 +186,7 @@ func TestMCPListChannelVideos(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	listing = res.StructuredContent.(*youtube.ChannelListing)
+	listing = res.StructuredContent.(channelListingOut).ChannelListing
 	if listing.Count != 12 || listing.Truncated {
 		t.Fatalf("limit=0: count=%d truncated=%v", listing.Count, listing.Truncated)
 	}

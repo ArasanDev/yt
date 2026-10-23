@@ -8,27 +8,61 @@ import (
 	"yt/internal/search"
 )
 
-func TestMCPTimestampWindowMatchesGranularity(t *testing.T) {
+// timestamp_window_seconds must describe the rendered timestamp's precision,
+// which follows timestamp_mode, not granularity: block-mode stamps cover a
+// merged ~30s span, cue-mode stamps are exact line starts, none has no stamps.
+func TestMCPTimestampWindowFollowsTimestampMode(t *testing.T) {
 	f, cleanup := newFakeYouTube(t)
 	defer cleanup()
 	s := NewServer(f.client)
 
-	block, _, err := s.getTranscript(context.Background(), nil, transcriptIn{URLOrID: "testvideo01", Granularity: "block"})
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name        string
+		granularity string
+		timestamps  bool // legacy alias
+		mode        string
+		wantWindow  int
+	}{
+		{"defaults", "", false, "", int(render.BlockSeconds)},
+		{"block/block", "block", false, "block", int(render.BlockSeconds)},
+		{"block/cue", "block", false, "cue", 0},
+		{"block/none", "block", false, "none", 0},
+		{"cue/block", "cue", false, "block", int(render.BlockSeconds)},
+		{"cue/cue", "cue", false, "cue", 0},
+		{"cue/none", "cue", false, "none", 0},
+		{"default/none", "", false, "none", 0},
+		{"legacy timestamps=true", "", true, "", 0},
+		{"legacy timestamps + explicit mode wins", "", true, "none", 0},
 	}
-	bout := block.StructuredContent.(transcriptOut)
-	if bout.TimestampWindowSeconds != int(render.BlockSeconds) {
-		t.Errorf("block window = %d, want %d", bout.TimestampWindowSeconds, int(render.BlockSeconds))
-	}
-
-	cue, _, err := s.getTranscript(context.Background(), nil, transcriptIn{URLOrID: "testvideo01", Granularity: "cue", TimestampMode: "cue"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cout := cue.StructuredContent.(transcriptOut)
-	if cout.TimestampWindowSeconds != 0 {
-		t.Errorf("cue window = %d, want 0", cout.TimestampWindowSeconds)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _, err := s.getTranscript(context.Background(), nil, transcriptIn{
+				URLOrID: "testvideo01", Granularity: tc.granularity,
+				TimestampMode: tc.mode, Timestamps: tc.timestamps,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.IsError {
+				t.Fatalf("unexpected tool error: %v", res.Content)
+			}
+			out := res.StructuredContent.(transcriptOut)
+			wantMode := tc.mode
+			if wantMode == "" {
+				if tc.timestamps {
+					wantMode = "cue"
+				} else {
+					wantMode = "block"
+				}
+			}
+			if out.TimestampMode != wantMode {
+				t.Errorf("timestamp_mode = %q, want %q", out.TimestampMode, wantMode)
+			}
+			if out.TimestampWindowSeconds != tc.wantWindow {
+				t.Errorf("timestamp_window_seconds = %d, want %d (mode=%q)",
+					out.TimestampWindowSeconds, tc.wantWindow, out.TimestampMode)
+			}
+		})
 	}
 }
 

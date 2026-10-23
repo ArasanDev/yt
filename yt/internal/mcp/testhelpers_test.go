@@ -23,6 +23,9 @@ type fakeYouTube struct {
 	json3Status int
 	captionBase string
 	description string
+	// captionJSON, when set, replaces the default json3 caption body so a
+	// test can control cue text (e.g. instruction-shaped captions).
+	captionJSON string
 }
 
 func newFakeYouTube(t *testing.T) (*fakeYouTube, func()) {
@@ -52,6 +55,10 @@ func newFakeYouTube(t *testing.T) (*fakeYouTube, func()) {
 		atomic.AddInt32(&f.json3Calls, 1)
 		if f.json3Status != http.StatusOK {
 			w.WriteHeader(f.json3Status)
+			return
+		}
+		if f.captionJSON != "" {
+			fmt.Fprint(w, f.captionJSON)
 			return
 		}
 		fmt.Fprint(w, `{"events":[{"tStartMs":0,"dDurationMs":1000,"segs":[{"utf8":"Hello world"}]}`)

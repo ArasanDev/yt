@@ -6,16 +6,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"yt/internal/apperr"
 	"yt/internal/mcp"
 	"yt/internal/render"
 	"yt/internal/search"
 	"yt/internal/transcript"
+	"yt/internal/version"
 	"yt/internal/youtube"
 )
 
@@ -35,6 +38,9 @@ var (
 	flagStart            float64
 	flagEnd              float64
 	flagMaxChars         int
+	flagStartCue         int
+	flagMaxCues          int
+	flagBare             bool
 	flagDescriptionChars int
 
 	flagChannelLimit   int
@@ -49,6 +55,57 @@ var (
 	flagSearchMode     string
 	flagSearchJSON     bool
 )
+
+// validateRange enforces the CLI time-range contract: non-negative bounds and
+// a start strictly before end when both are set.
+func validateRange(start, end float64) error {
+	if start < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --start %v: must be >= 0", start)
+	}
+	if end < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --end %v: must be >= 0", end)
+	}
+	if start > 0 && end > 0 && start >= end {
+		return apperr.New(apperr.CodeBadRequest, "inverted range: --start %v must be less than --end %v", start, end)
+	}
+	return nil
+}
+
+// validateTranscriptFlags must run before any network fetch so a typo'd flag
+// fails instantly instead of after the caption download.
+func validateTranscriptFlags(cmd *cobra.Command) error {
+	switch flagFormat {
+	case "text", "json", "srt":
+	default:
+		return apperr.New(apperr.CodeBadRequest, "unknown --format %q (text|json|srt)", flagFormat)
+	}
+	if err := validateRange(flagStart, flagEnd); err != nil {
+		return err
+	}
+	if flagMaxChars < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --max-chars %d: must be >= 0 (0 = unlimited)", flagMaxChars)
+	}
+	if flagStartCue < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --start-cue %d: must be >= 0", flagStartCue)
+	}
+	if flagMaxCues < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --max-cues %d: must be >= 0 (0 = unlimited)", flagMaxCues)
+	}
+	if flagBare && flagFormat != "text" {
+		return apperr.New(apperr.CodeBadRequest, "--bare applies only to --format text (got %q)", flagFormat)
+	}
+	// SRT keeps results raw: the budget, cue and timestamp flags would change
+	// nothing, so passing any of them is rejected instead of ignored.
+	if flagFormat == "srt" {
+		for _, f := range []string{"max-chars", "max-cues", "start-cue", "granularity", "timestamps", "timestamp-mode"} {
+			if cmd.Flags().Changed(f) {
+				return apperr.New(apperr.CodeBadRequest,
+					"--%s does not apply to --format srt; use it with --format text or json", f)
+			}
+		}
+	}
+	return nil
+}
 
 func runTranscript(client *youtube.Client, args []string) error {
 	id, err := youtube.ExtractVideoID(args[0])
@@ -77,16 +134,28 @@ func runTranscript(client *youtube.Client, args []string) error {
 			TimestampMode: timestampMode,
 			StartSeconds:  flagStart,
 			EndSeconds:    flagEnd,
+			StartCue:      flagStartCue,
+			MaxCues:       flagMaxCues,
 			MaxChars:      flagMaxChars,
+			Bare:          flagBare,
 		})
 		for _, n := range r.Notes {
 			fmt.Fprintln(os.Stderr, "note:", n)
+		}
+		// Bare output keeps stdout clean; truncation must still be visible,
+		// so for --bare it moves to stderr instead of disappearing.
+		if flagBare && r.Truncated && r.NextStartSeconds != nil && r.NextCueIndex != nil {
+			fmt.Fprintf(os.Stderr, "truncated: cues=%d/%d; resume with --start-cue %d or --start %s\n",
+				r.ReturnedCues, r.TotalCues, *r.NextCueIndex,
+				strconv.FormatFloat(*r.NextStartSeconds, 'f', -1, 64))
 		}
 		out = r.Text
 	case "json":
 		js := render.SelectForJSON(t.Segments, t.DurationSeconds, render.Options{
 			StartSeconds: flagStart,
 			EndSeconds:   flagEnd,
+			StartCue:     flagStartCue,
+			MaxCues:      flagMaxCues,
 			MaxChars:     flagMaxChars,
 		})
 		subset := *t
@@ -106,7 +175,7 @@ func runTranscript(client *youtube.Client, args []string) error {
 		segs := render.Select(t.Segments, render.Options{StartSeconds: flagStart, EndSeconds: flagEnd})
 		out = render.FormatSRT(&transcript.Transcript{Segments: segs})
 	default:
-		return fmt.Errorf("unknown format %q (text|json|srt)", flagFormat)
+		return apperr.New(apperr.CodeBadRequest, "unknown --format %q (text|json|srt)", flagFormat)
 	}
 
 	fmt.Fprintf(os.Stderr, "via %s | lang=%s original=%s generated=%v translated=%v | %d segments\n",
@@ -125,11 +194,20 @@ func runSearch(client *youtube.Client, args []string) error {
 	if err != nil {
 		return err
 	}
+	if flagSearchStartCue < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --start-cue %d: must be >= 0", flagSearchStartCue)
+	}
+	if flagSearchContext < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --context-cues %d: must be >= 0", flagSearchContext)
+	}
+	if flagSearchMax < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --max-matches %d: must be >= 0", flagSearchMax)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*youtube.TotalDeadline)
 	defer cancel()
 	mode, ok := search.ParseMode(flagSearchMode)
 	if !ok {
-		return fmt.Errorf("unknown match mode %q (all|any|phrase)", flagSearchMode)
+		return apperr.New(apperr.CodeBadRequest, "unknown match mode %q (all|any|phrase)", flagSearchMode)
 	}
 	t, err := client.Transcript(ctx, id, youtube.TranscriptOptions{
 		Languages:        youtube.ParseLanguages(flagSearchLangs),
@@ -164,7 +242,15 @@ func runSearch(client *youtube.Client, args []string) error {
 	fmt.Fprintf(os.Stderr, "%s | lang=%s generated=%v | %d matches (%s)\n",
 		t.VideoID, t.Language, t.Generated, res.TotalMatches, res.MatchMode)
 	for _, m := range res.Matches {
+		// ContextCues is computed search-side; surface it in human output as
+		// indented lines around the match.
+		if m.Before != "" {
+			fmt.Printf("    … %s\n", m.Before)
+		}
 		fmt.Printf("[%s] %s\n", m.Timestamp, m.Text)
+		if m.After != "" {
+			fmt.Printf("    … %s\n", m.After)
+		}
 	}
 	for _, n := range res.Notes {
 		fmt.Fprintln(os.Stderr, "note:", n)
@@ -204,6 +290,9 @@ func runInfo(client *youtube.Client, args []string) error {
 	if err != nil {
 		return err
 	}
+	if flagDescriptionChars < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --description-chars %d: must be >= 0 (0 = full)", flagDescriptionChars)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), youtube.TotalDeadline)
 	defer cancel()
 	info, err := client.Info(ctx, id, flagDescriptionChars)
@@ -219,6 +308,12 @@ func runInfo(client *youtube.Client, args []string) error {
 }
 
 func runChannel(client *youtube.Client, args []string) error {
+	if flagChannelLimit < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --limit %d: must be >= 0 (0 = all; the feed exposes at most 15)", flagChannelLimit)
+	}
+	if flagChannelSummary < 0 {
+		return apperr.New(apperr.CodeBadRequest, "invalid --description-chars %d: must be >= 0 (0 = full)", flagChannelSummary)
+	}
 	var since time.Time
 	if strings.TrimSpace(flagChannelSince) != "" {
 		t, err := youtube.ParseSince(flagChannelSince)
@@ -302,8 +397,9 @@ func formatJSON(v any) (string, error) {
 // embedders can use another acquisition origin.
 func NewRootCmd(client *youtube.Client) *cobra.Command {
 	root := &cobra.Command{
-		Use:   "yt",
-		Short: "YouTube transcripts for agents and humans",
+		Use:     "yt",
+		Version: version.Version,
+		Short:   "YouTube transcripts for agents and humans",
 		Long: "Fetch YouTube captions via the Innertube API (ANDROID/IOS clients) — " +
 			"no API key, no AI, single static binary.\n" +
 			"Run `yt mcp` (or `yt` with piped stdin) to expose the tools over MCP stdio.",
@@ -321,7 +417,10 @@ func NewRootCmd(client *youtube.Client) *cobra.Command {
 		Use:   "transcript <url-or-id>",
 		Short: "Fetch a video transcript",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateTranscriptFlags(cmd); err != nil {
+				return err
+			}
 			return runTranscript(client, args)
 		},
 	}
@@ -334,13 +433,24 @@ func NewRootCmd(client *youtube.Client) *cobra.Command {
 	transcriptCmd.Flags().StringVar(&flagGranularity, "granularity", "block",
 		"cue|block (default)")
 	transcriptCmd.Flags().StringVarP(&flagFormat, "format", "f", "text",
-		"output format: text|json|srt")
+		"output format: text|json|srt (text: metadata header + plain body; "+
+			"srt rejects --max-chars/--max-cues/--start-cue/--granularity and the timestamp flags)")
 	transcriptCmd.Flags().StringVarP(&flagOutput, "output", "o", "",
 		"write to file instead of stdout")
-	transcriptCmd.Flags().Float64Var(&flagStart, "start", 0, "start time in seconds")
-	transcriptCmd.Flags().Float64Var(&flagEnd, "end", 0, "end time in seconds")
+	transcriptCmd.Flags().Float64Var(&flagStart, "start", 0,
+		"start time in seconds; resume from next_start_seconds")
+	transcriptCmd.Flags().Float64Var(&flagEnd, "end", 0,
+		"end time in seconds (cues starting at or after it are excluded)")
 	transcriptCmd.Flags().IntVar(&flagMaxChars, "max-chars", 0,
-		"limit transcript characters (0 = unlimited)")
+		"limit transcript body characters (0 = unlimited; this CLI has no default cap, "+
+			"while the MCP get_transcript tool defaults to 50000)")
+	transcriptCmd.Flags().IntVar(&flagStartCue, "start-cue", 0,
+		"skip cues before this index (0 = from the first cue)")
+	transcriptCmd.Flags().IntVar(&flagMaxCues, "max-cues", 0,
+		"return at most N cues (0 = unlimited); truncation is reported with resume pointers")
+	transcriptCmd.Flags().BoolVar(&flagBare, "bare", false,
+		"text format only: omit the metadata header and truncation trailer so stdout pipes cleanly; "+
+			"truncation is reported on stderr")
 
 	searchCmd := &cobra.Command{
 		Use:   "search <url-or-id> <query>",
@@ -410,7 +520,7 @@ func NewRootCmd(client *youtube.Client) *cobra.Command {
 
 	mcpCmd := &cobra.Command{
 		Use:   "mcp",
-		Short: "Serve MCP tools over stdio (get_video_info, get_transcript, search_transcript, list_tracks)",
+		Short: "Serve MCP tools over stdio (get_video_info, get_transcript, search_transcript, list_tracks, list_channel_videos)",
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return mcp.Run(client)

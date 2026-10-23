@@ -34,6 +34,52 @@ func TestParseChaptersVariants(t *testing.T) {
 	}
 }
 
+func TestParseChaptersDecoratedHeadings(t *testing.T) {
+	for _, desc := range []string{
+		"Chapters: 00:00 Intro\n00:10 Body",
+		"Chapters 0:00 Intro\n00:10 Body",
+		"📝 Chapters\n00:00 Intro\n00:10 Body",
+		"## Chapters\n00:00 Intro\n00:10 Body",
+		"**Timestamps**\n00:00 Intro\n00:10 Body",
+		"⏱️ Timestamps:\n00:00 Intro\n00:10 Body",
+	} {
+		got := parseChapters(desc, 100)
+		if len(got) != 2 || got[0].Title != "Intro" || got[0].StartSeconds != 0 || got[1].Title != "Body" {
+			t.Errorf("decorated heading %q parsed %+v", desc, got)
+		}
+	}
+}
+
+// A line that merely starts with the heading word but continues in prose must
+// not be mistaken for a heading.
+func TestParseChaptersRejectsProseMistakingForHeading(t *testing.T) {
+	if got := parseChapters("Chapters are below\n00:00 Intro\n00:10 Body", 100); got != nil {
+		t.Fatalf("prose line is not a heading, got %+v", got)
+	}
+}
+
+// Invalid, duplicate, out-of-order, and past-duration entries are dropped;
+// the valid remainder is kept.
+func TestParseChaptersDropsInvalidEntries(t *testing.T) {
+	desc := "Chapters:\n00:00 Intro\n99:99 Broken\n00:10 Body\n00:10 Duplicate\n00:05 OutOfOrder\n1:00:00 Past"
+	got := parseChapters(desc, 120)
+	if len(got) != 2 || got[0].Title != "Intro" || got[1].Title != "Body" {
+		t.Fatalf("invalid entries must be dropped, not reject the list: %+v", got)
+	}
+}
+
+func TestParseChaptersInDurationRule(t *testing.T) {
+	desc := "Chapters:\n00:00 A\n00:59 B\n01:00 C"
+	got := parseChapters(desc, 60)
+	if len(got) != 2 || got[1].Title != "B" {
+		t.Fatalf("an entry at/after the duration must be dropped, got %+v", got)
+	}
+	// An unknown duration (0) disables the bound.
+	if got := parseChapters(desc, 0); len(got) != 3 {
+		t.Fatalf("unknown duration must not filter entries, got %+v", got)
+	}
+}
+
 func TestParseChaptersRejectsUnreliableLists(t *testing.T) {
 	cases := map[string]struct {
 		desc     string

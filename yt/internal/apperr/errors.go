@@ -97,9 +97,9 @@ func ClassifyHTTPStatus(status int, retryAfter string) *Error {
 		te.Message = "YouTube returned HTTP 404; the video or caption URL was not found."
 	case status == http.StatusForbidden:
 		te.Code = CodeBlocked
-		te.Message = "YouTube blocked the request (HTTP 403); the signed caption URL may have expired."
+		te.Message = "YouTube blocked the request (HTTP 403); this can be an expired signed URL or an IP-level block."
 		te.Retryable = true
-		te.Suggestion = "Retry; caption URLs are short-lived."
+		te.Suggestion = "Retry once; if it persists, retry later or from another network."
 	}
 	return te
 }
@@ -126,12 +126,18 @@ func ClassifyPlayability(status, reason string) *Error {
 			return te
 		}
 	case "ERROR":
+		if strings.Contains(lower, "private") {
+			te := New(CodePrivate, "This video is private: %s", reason)
+			te.Suggestion = "Private videos are not supported."
+			return te
+		}
 		if isNotFoundReason(lower) {
 			return New(CodeNotFound, "YouTube reports this video as unavailable: %s", reason)
 		}
 		// A bare ERROR is often a transient or IP-level block, not a verdict on
 		// the video, so it must not short-circuit the client cascade.
 		te := New(CodeBlocked, "YouTube reported an error for this video: %s", reason)
+		te.Retryable = true
 		te.Suggestion = "This may be a temporary block; retry later or from another network."
 		return te
 	case "UNPLAYABLE":
@@ -186,50 +192,142 @@ func ClassifyContext(err error) *Error {
 // Aggregate collapses the failure of the ANDROID -> IOS -> watch-page cascade
 // into one typed error an agent can act on, preserving the most specific verdict
 // and any Retry-After hint.
+//
+// When every attempt failed with the same code the winner is not a synthetic
+// "all methods failed" error: the most specific constituent error (longest
+// message, then a suggestion) is preserved with its suggestion,
+// Retry-After, and available-language list. Mixed-code failures still collapse
+// to upstream_changed, but keep the union of actionable hints.
 func Aggregate(errs []error) *Error {
-	if len(errs) == 0 {
-		return New(CodeUpstreamChanged, "all YouTube acquisition methods failed")
+	type codeGroup struct {
+		best *Error
 	}
-	counts := map[Code]int{}
+
+	groups := map[Code]*codeGroup{}
 	retryAfter := 0
-	for _, e := range errs {
-		te, ok := As(e)
-		if !ok {
-			counts[CodeInternal]++
+	var languages []string
+	total := 0
+	for _, err := range errs {
+		if err == nil {
 			continue
 		}
-		counts[te.Code]++
+		te, ok := As(err)
+		if !ok || te == nil {
+			te = &Error{Code: CodeInternal, Message: err.Error()}
+		}
+		total++
+		g := groups[te.Code]
+		if g == nil {
+			g = &codeGroup{}
+			groups[te.Code] = g
+		}
+		if g.best == nil || moreSpecific(te, g.best) {
+			g.best = te
+		}
 		if te.RetryAfterSeconds > retryAfter {
 			retryAfter = te.RetryAfterSeconds
 		}
+		languages = mergeLanguages(languages, te.AvailableLanguages)
 	}
-	if counts[CodeRateLimited] == len(errs) {
-		te := New(CodeRateLimited, "All YouTube endpoints rate-limited the request.")
-		te.Retryable = true
-		te.RetryAfterSeconds = retryAfter
-		te.Suggestion = "Wait before retrying; repeated calls from one IP are throttled."
-		return te
+	if total == 0 {
+		return upstreamChangedFallback()
 	}
-	if len(counts) == 1 {
-		for code := range counts {
-			te := New(code, "All YouTube acquisition methods failed with code %s.", code)
-			te.Retryable = code == CodeRateLimited || code == CodeNetwork || code == CodeBlocked || code == CodeUpstreamChanged
-			te.RetryAfterSeconds = retryAfter
-			te.Suggestion = suggestionForCode(code)
+
+	if len(groups) == 1 {
+		for code, g := range groups {
+			best := g.best
+			te := &Error{
+				Code:               code,
+				Message:            best.Message,
+				Retryable:          retryableCode(code) || best.Retryable,
+				RetryAfterSeconds:  retryAfter,
+				AvailableLanguages: languages,
+				Suggestion:         best.Suggestion,
+			}
+			if te.Message == "" {
+				te.Message = fmt.Sprintf("All YouTube acquisition methods failed with code %s.", code)
+			}
+			if te.Suggestion == "" {
+				te.Suggestion = suggestionForCode(code)
+			}
 			return te
 		}
 	}
-	codes := make([]string, 0, len(counts))
-	for code := range counts {
+
+	codes := make([]string, 0, len(groups))
+	retryable := false
+	for code, g := range groups {
 		codes = append(codes, string(code))
+		if retryableCode(code) || g.best.Retryable {
+			retryable = true
+		}
 	}
 	sort.Strings(codes)
 	te := New(CodeUpstreamChanged,
 		"All YouTube acquisition methods failed (%s).", strings.Join(codes, ", "))
-	te.Retryable = true
+	te.Retryable = retryable
 	te.RetryAfterSeconds = retryAfter
-	te.Suggestion = "Retry once; if it persists, run `yt doctor` and update the client versions."
+	te.AvailableLanguages = languages
+	if retryable {
+		te.Suggestion = suggestionForCode(CodeUpstreamChanged)
+	} else {
+		te.Suggestion = "This failure mixes non-retryable causes; inspect the codes and avoid retrying unchanged."
+	}
 	return te
+}
+
+func upstreamChangedFallback() *Error {
+	te := New(CodeUpstreamChanged, "All YouTube acquisition methods failed.")
+	te.Retryable = true
+	te.Suggestion = suggestionForCode(CodeUpstreamChanged)
+	return te
+}
+
+// moreSpecific reports whether a is a better representative of a shared error
+// code than b: a real message beats an empty one, longer messages tend to be
+// more diagnostic, and a suggestion/language list breaks ties.
+func moreSpecific(a, b *Error) bool {
+	if (a.Message != "") != (b.Message != "") {
+		return a.Message != ""
+	}
+	if len(a.Message) != len(b.Message) {
+		return len(a.Message) > len(b.Message)
+	}
+	if (a.Suggestion != "") != (b.Suggestion != "") {
+		return a.Suggestion != ""
+	}
+	if (a.RetryAfterSeconds > 0) != (b.RetryAfterSeconds > 0) {
+		return a.RetryAfterSeconds > 0
+	}
+	return len(a.AvailableLanguages) > len(b.AvailableLanguages)
+}
+
+func mergeLanguages(dst, src []string) []string {
+	if len(src) == 0 {
+		return dst
+	}
+	seen := make(map[string]struct{}, len(dst)+len(src))
+	for _, l := range dst {
+		seen[l] = struct{}{}
+	}
+	for _, l := range src {
+		if _, ok := seen[l]; ok {
+			continue
+		}
+		seen[l] = struct{}{}
+		dst = append(dst, l)
+	}
+	return dst
+}
+
+// retryableCode reports whether a code describes a condition that may clear up
+// on its own. Timeouts are included: the request did not reach a verdict.
+func retryableCode(code Code) bool {
+	switch code {
+	case CodeRateLimited, CodeNetwork, CodeBlocked, CodeUpstreamChanged, CodeTimeout:
+		return true
+	}
+	return false
 }
 
 func suggestionForCode(code Code) string {
@@ -242,6 +340,8 @@ func suggestionForCode(code Code) string {
 		return "Wait before retrying."
 	case CodeUpstreamChanged:
 		return "Retry once; if it persists, run `yt doctor` and update the client versions."
+	case CodeTimeout:
+		return "Retry, or narrow the request with start_seconds/end_seconds."
 	case CodeChannelNotFound:
 		return "Check the handle or channel URL; run `yt channel @handle` with a channel that exists."
 	case CodeNotAChannel:

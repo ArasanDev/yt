@@ -63,6 +63,40 @@ func TestSearchCollapsesSpelledAcronym(t *testing.T) {
 	}
 }
 
+// A contiguous run of single-letter tokens inside a larger query must collapse
+// too, not only when the whole query is the acronym.
+func TestSearchCollapsesAcronymRunInsideQuery(t *testing.T) {
+	segs := []transcript.Segment{{Start: 0, Text: "the mcp server exposes tools"}}
+	res := Segments(segs, Options{Query: "M C P server"})
+	if res.TotalMatches != 1 {
+		t.Fatalf("acronym run inside a query should collapse, got %d matches; terms=%+v", res.TotalMatches, res.Terms)
+	}
+	if len(res.Terms) != 2 || res.Terms[0].Term != "mcp" || res.Terms[1].Term != "server" {
+		t.Errorf("terms = %+v, want [mcp server]", res.Terms)
+	}
+}
+
+// Ordinary short words ("ai", "ml") are not acronym letters and must not be
+// glued into nonsense.
+func TestSearchDoesNotCollapseOrdinaryShortWords(t *testing.T) {
+	segs := []transcript.Segment{{Start: 0, Text: "ai and ml together"}}
+	res := Segments(segs, Options{Query: "ai ml"})
+	if len(res.Terms) != 2 || res.Terms[0].Term != "ai" || res.Terms[1].Term != "ml" {
+		t.Fatalf("two-letter words must not collapse into an acronym, terms=%+v", res.Terms)
+	}
+	if res.TotalMatches != 1 {
+		t.Fatalf("both terms exist in one cue, got %d matches", res.TotalMatches)
+	}
+}
+
+func TestSearchDoesNotCollapseTwoSingleLetters(t *testing.T) {
+	segs := []transcript.Segment{{Start: 0, Text: "a b testing"}}
+	res := Segments(segs, Options{Query: "a b"})
+	if len(res.Terms) != 2 || res.Terms[0].Term != "a" || res.Terms[1].Term != "b" {
+		t.Fatalf("two single-letter words must not collapse into an acronym, terms=%+v", res.Terms)
+	}
+}
+
 func TestSearchShortTermUsesWordBoundary(t *testing.T) {
 	segs := []transcript.Segment{
 		{Start: 0, Text: "she said the chain is fine"},

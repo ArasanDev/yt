@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 
 	"yt/internal/apperr"
@@ -75,23 +76,32 @@ func (c *Client) selectAndDownload(ctx context.Context, videoID string, pr *play
 // needsTlang means YouTube is translating the fetched track on the fly.
 //
 // Auto-dubbed videos expose one ASR track per audio language, and every
-// non-original ASR track is a machine translation served as a track. Requesting
-// "es" on an English video must not report translated=false with
-// original_language="es": that presents translated speech as the speaker's words.
+// non-original track is a translation served as a track. Requesting "es" on an
+// English video must not report translated=false with original_language="es":
+// that presents translated speech as the speaker's words. A manual track in
+// another language (an uploader-supplied translation) is just as much a
+// translation as an ASR dub; generated/ASR is reported separately.
+//
+// When the player response carries no audio-track metadata the original is
+// unknown. OriginalLanguage is then left empty — an explicit "unknown" —
+// instead of being filled with the chosen track's language. This is a
+// deliberate representation choice over a hard error: responses without audio
+// metadata are routine (ANDROID/IOS clients, the watch-page fallback), and
+// erroring would fail legitimate fetches where the caller asked for a specific
+// language and never claimed provenance.
 func transcriptIdentity(track, original *captionTrack, needsTlang bool, target string) (language, originalLanguage, translationTarget string, translated bool) {
 	language = track.LanguageCode
-	originalLanguage = track.LanguageCode
+	if original != nil {
+		originalLanguage = original.LanguageCode
+	}
 	switch {
 	case needsTlang:
 		language = target
 		translationTarget = target
 		translated = true
-	case original != nil:
-		originalLanguage = original.LanguageCode
-		if track.Kind == "asr" && !langMatches(track.LanguageCode, original.LanguageCode) {
-			translated = true
-			translationTarget = track.LanguageCode
-		}
+	case original != nil && !langMatches(track.LanguageCode, original.LanguageCode):
+		translated = true
+		translationTarget = track.LanguageCode
 	}
 	return
 }
@@ -108,31 +118,48 @@ func pickTrack(tracks []captionTrack, langs []string, allowTranslation bool) (*c
 }
 
 // pickTrackWithOriginal is pickTrack plus the actual uploader-language track
-// (resolved from the player response). Passing nil preserves the legacy
-// "first track" fallback used by tests and by responses without audio tracks.
+// (resolved from the player response). Passing nil means the original is
+// unknown: the "original" sentinel then resolves only when the response lists
+// a single caption language, and fails loudly instead of silently serving
+// tracks[0] as "the original" when multiple languages exist.
 func pickTrackWithOriginal(tracks []captionTrack, original *captionTrack, langs []string, allowTranslation bool) (*captionTrack, bool, string, error) {
 	langs = normalizeLanguages(langs)
+	sawOriginal, sawOther := false, false
 	for _, lang := range langs {
 		if lang == OriginalLanguageValue {
-			if original != nil {
-				return original, false, "", nil
+			sawOriginal = true
+			src := original
+			if src == nil {
+				src = inferredOriginal(tracks)
 			}
-			if t := originalTrack(tracks); t != nil {
-				return t, false, "", nil
+			if src != nil {
+				return src, false, "", nil
 			}
 			continue
 		}
+		sawOther = true
 		for _, wantASR := range []bool{false, true} {
-			for i := range tracks {
-				t := &tracks[i]
-				if (t.Kind == "asr") == wantASR && langMatches(t.LanguageCode, lang) {
-					return t, false, "", nil
-				}
+			if t := pickLangTrack(tracks, lang, wantASR); t != nil {
+				return t, false, "", nil
 			}
 		}
 	}
+	// Only "original" was asked for and the response gives no way to know it:
+	// fail with the reason instead of guessing (or, with translation enabled,
+	// machine-translating from an arbitrary source track).
+	if sawOriginal && !sawOther && original == nil && inferredOriginal(tracks) == nil {
+		te := apperr.New(apperr.CodeNoMatchingLang,
+			"The original language cannot be determined: the response lists multiple caption languages without audio-track metadata.")
+		te.AvailableLanguages = trackLanguages(tracks)
+		te.Suggestion = "Request a specific language from available_languages instead of \"original\"."
+		return nil, false, "", te
+	}
 	if !allowTranslation {
-		return nil, false, "", noMatchingLanguage(tracks, langs)
+		te := noMatchingLanguage(tracks, langs)
+		if sawOriginal && original == nil {
+			te.Suggestion = "The original language could not be determined from the player response; request a specific language from available_languages."
+		}
+		return nil, false, "", te
 	}
 	// Translate from the uploader's own track, not whichever track YouTube
 	// happened to list first: auto-dubbed videos list one ASR track per
@@ -160,21 +187,78 @@ func pickTrackWithOriginal(tracks []captionTrack, original *captionTrack, langs 
 		}
 		return src, true, target, nil
 	}
-	return nil, false, "", noMatchingLanguage(tracks, langs)
+	te := noMatchingLanguage(tracks, langs)
+	if allowTranslation {
+		te.Message = "No caption track matches the requested languages, and no remaining track is translatable."
+		te.Suggestion = "Retry with one of available_languages or pass \"original\"."
+	}
+	return nil, false, "", te
 }
 
-// originalTrack returns the uploader's preferred track: a manual track if one
-// exists, otherwise the first auto-generated track.
-func originalTrack(tracks []captionTrack) *captionTrack {
+// pickLangTrack selects the best manual (or, with wantASR, auto-generated)
+// track for a requested language. Exact code matches win over base-language
+// matches, and an unqualified candidate ("en" for an "en-us" request) beats a
+// different regional variant ("en-gb"), so the same response always yields
+// the same track instead of whichever variant the list happened to serve
+// first. Ties keep list order, which is deterministic.
+func pickLangTrack(tracks []captionTrack, lang string, wantASR bool) *captionTrack {
+	var best *captionTrack
+	bestRank := 0
+	for i := range tracks {
+		t := &tracks[i]
+		if (t.Kind == "asr") != wantASR {
+			continue
+		}
+		r := langRank(t.LanguageCode, lang)
+		if r < 0 {
+			continue
+		}
+		if best == nil || r < bestRank {
+			best, bestRank = t, r
+		}
+	}
+	return best
+}
+
+// langRank scores how well a track code satisfies a request: 0 = exact,
+// 1 = request base with an unqualified candidate, 2 = same base language,
+// -1 = no match.
+func langRank(code, want string) int {
+	switch {
+	case code == want:
+		return 0
+	case baseLang(want) != want && code == baseLang(want):
+		return 1
+	case langMatches(code, want):
+		return 2
+	default:
+		return -1
+	}
+}
+
+// inferredOriginal recovers the original track from responses that carry no
+// audio-track metadata. It only answers when the evidence is unambiguous: a
+// single caption language, where the manual track (if any) is preferred. A
+// multi-language list (auto-dubbing emits one ASR track per audio language)
+// carries no signal about which language the speaker used; guessing wrong
+// would brand a machine dub as the speaker's own words, so it returns nil and
+// provenance stays unknown.
+func inferredOriginal(tracks []captionTrack) *captionTrack {
+	if len(tracks) == 0 {
+		return nil
+	}
+	lang := baseLang(tracks[0].LanguageCode)
+	for i := range tracks {
+		if baseLang(tracks[i].LanguageCode) != lang {
+			return nil
+		}
+	}
 	for i := range tracks {
 		if tracks[i].Kind != "asr" {
 			return &tracks[i]
 		}
 	}
-	if len(tracks) > 0 {
-		return &tracks[0]
-	}
-	return nil
+	return &tracks[0]
 }
 
 func baseLang(code string) string {
@@ -191,12 +275,16 @@ func langMatches(code, lang string) bool {
 // originalTrackFrom identifies the uploader's own language instead of assuming
 // the first track is it. Videos with auto-dubbing expose one ASR track per
 // language, and the first entry is arbitrary (e.g. Arabic for an English
-// video). defaultAudioTrackIndex points at the original audio; its caption
-// list names the matching caption track.
+// video).
 //
-// It returns nil when the response carries no audio-track metadata. Callers
-// that only need a usable track for the "original" sentinel can fall back to
-// originalTrack(tracks); provenance code must not guess.
+// Resolution order:
+//  1. The default audio track's CaptionTrackIndices mapping — YouTube's own
+//     authoritative audio→caption association, preferred over any matching.
+//  2. A language match against the default audio track's id (manual first).
+//  3. inferredOriginal, which answers only single-language responses.
+//
+// It returns nil when the original cannot be established. Callers that report
+// provenance must not guess: nil means "unknown", not "first track".
 func originalTrackFrom(pr *playerResponse) *captionTrack {
 	tracks := pr.tracks()
 	if len(tracks) == 0 {
@@ -206,27 +294,32 @@ func originalTrackFrom(pr *playerResponse) *captionTrack {
 	idx := r.DefaultAudioTrackIndex
 	if len(r.AudioTracks) > 0 && idx >= 0 && idx < len(r.AudioTracks) {
 		at := r.AudioTracks[idx]
-		lang := at.AudioTrackID
-		if i := strings.IndexByte(lang, '.'); i > 0 {
-			lang = lang[:i]
-		}
-		if lang != "" {
-			for _, wantASR := range []bool{false, true} {
-				for i := range tracks {
-					t := &tracks[i]
-					if (t.Kind == "asr") == wantASR && langMatches(t.LanguageCode, lang) {
-						return t
-					}
-				}
-			}
-		}
-		if len(at.CaptionTrackIndices) > 0 {
-			if ci := at.CaptionTrackIndices[0]; ci >= 0 && ci < len(tracks) {
+		// YouTube's own mapping is authoritative: honour it before falling
+		// back to language matching, which can pick a same-language dub.
+		for _, ci := range at.CaptionTrackIndices {
+			if ci >= 0 && ci < len(tracks) {
 				return &tracks[ci]
 			}
 		}
+		if lang := audioTrackBaseLang(at.AudioTrackID); lang != "" {
+			if t := pickLangTrack(tracks, lang, false); t != nil {
+				return t
+			}
+			if t := pickLangTrack(tracks, lang, true); t != nil {
+				return t
+			}
+		}
 	}
-	return nil
+	return inferredOriginal(tracks)
+}
+
+// audioTrackBaseLang strips the trailing channel suffix from an audio track id
+// like "en-US.4".
+func audioTrackBaseLang(id string) string {
+	if i := strings.IndexByte(id, '.'); i > 0 {
+		return id[:i]
+	}
+	return id
 }
 
 func noMatchingLanguage(tracks []captionTrack, langs []string) *apperr.Error {
@@ -267,6 +360,11 @@ func captionURL(baseURL, format, tlang string, translate bool) (string, error) {
 // the format parameter. A transport failure on one format no longer aborts the
 // fallback, and if both formats parse to zero cues the track is genuinely empty
 // (reported as no_captions by the caller).
+//
+// Response classification: a 403 surfaces as the typed blocked error (signed
+// caption URLs are short-lived), a 200 bot-check HTML page as bot_check, and
+// any other HTML/non-caption payload as upstream_changed — never as an empty
+// track.
 func (c *Client) downloadSegments(ctx context.Context, baseURL, targetLang string, translate bool) ([]transcript.Segment, error) {
 	var errs []error
 	for _, format := range []string{"json3", "srv3"} {
@@ -285,6 +383,12 @@ func (c *Client) downloadSegments(ctx context.Context, baseURL, targetLang strin
 		body, err := readBody(resp, 32<<20)
 		if err != nil {
 			errs = append(errs, err)
+			continue
+		}
+		if looksLikeHTML(body) {
+			// A 200 HTML page is not a caption payload: distinguish an
+			// IP-level bot check from a changed endpoint.
+			errs = append(errs, captionBodyError(format, body))
 			continue
 		}
 		var segs []transcript.Segment
@@ -307,12 +411,51 @@ func (c *Client) downloadSegments(ctx context.Context, baseURL, targetLang strin
 	return nil, apperr.Aggregate(errs)
 }
 
+// looksLikeHTML sniffs the leading bytes of a response body.
+func looksLikeHTML(body []byte) bool {
+	n := len(body)
+	if n > 1024 {
+		n = 1024
+	}
+	prefix := strings.ToLower(string(body[:n]))
+	return strings.Contains(prefix, "<html") || strings.Contains(prefix, "<!doctype")
+}
+
+// captionBodyError classifies a 200 response whose body is HTML instead of a
+// caption payload: a bot-check page is an IP-level block, any other HTML page
+// means the caption endpoint changed shape.
+func captionBodyError(format string, body []byte) *apperr.Error {
+	n := len(body)
+	if n > 8192 {
+		n = 8192
+	}
+	prefix := strings.ToLower(string(body[:n]))
+	for _, marker := range []string{
+		"unusual traffic", "not a bot", "confirm you", "sign in to confirm",
+		"captcha", "bot check",
+	} {
+		if strings.Contains(prefix, marker) {
+			te := apperr.New(apperr.CodeBotCheck,
+				"YouTube served a bot-check page instead of the %s caption track.", format)
+			te.Suggestion = "This is an IP-level block, not a problem with the video. Retry later or from another network."
+			return te
+		}
+	}
+	te := apperr.New(apperr.CodeUpstreamChanged,
+		"YouTube returned an HTML page instead of the %s caption payload.", format)
+	te.Suggestion = "Retry once; if it persists, run `yt doctor` and update the client versions."
+	return te
+}
+
 // ---- json3 format ----
 
 type json3Doc struct {
 	Events []struct {
-		StartMs    int64 `json:"tStartMs"`
-		DurationMs int64 `json:"dDurationMs"`
+		// tStartMs is a pointer because some payloads omit it; a missing
+		// start must not silently collapse to 0 and poison cue ordering,
+		// range selection, and block boundaries downstream.
+		StartMs    *int64 `json:"tStartMs"`
+		DurationMs int64  `json:"dDurationMs"`
 		Segs       []struct {
 			UTF8 string `json:"utf8"`
 		} `json:"segs"`
@@ -325,6 +468,7 @@ func parseJSON3(body []byte) ([]transcript.Segment, error) {
 		return nil, err
 	}
 	var out []transcript.Segment
+	prevStart := int64(0)
 	for _, ev := range doc.Events {
 		var b strings.Builder
 		for _, s := range ev.Segs {
@@ -334,14 +478,45 @@ func parseJSON3(body []byte) ([]transcript.Segment, error) {
 		if text == "" {
 			continue
 		}
+		// A cue without a usable start inherits the previous cue's start
+		// instead of jumping the timeline back to zero.
+		start := prevStart
+		if ev.StartMs != nil && *ev.StartMs >= 0 {
+			start = *ev.StartMs
+		}
+		prevStart = start
 		out = append(out, transcript.Segment{
-			Start:    float64(ev.StartMs) / 1000,
+			Start:    float64(start) / 1000,
 			Duration: float64(ev.DurationMs) / 1000,
 			Text:     text,
 		})
 	}
+	// Events are not guaranteed to arrive in order, and repeated events
+	// duplicate cues; both would poison SRT output and windowed search.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+	out = dedupeExactCues(out)
 	deriveDurations(out)
 	return out, nil
+}
+
+// dedupeExactCues drops cues whose (start, text) pair is identical to an
+// earlier cue. Cues sharing a start but differing in text are kept.
+func dedupeExactCues(segs []transcript.Segment) []transcript.Segment {
+	type cue struct {
+		start float64
+		text  string
+	}
+	seen := make(map[cue]struct{}, len(segs))
+	out := segs[:0]
+	for _, s := range segs {
+		k := cue{s.Start, s.Text}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // deriveDurations backfills missing durations from the next cue's start so that

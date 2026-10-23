@@ -1,6 +1,8 @@
 package youtube
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -41,5 +43,32 @@ func TestMemoRejectsOversizedEntry(t *testing.T) {
 	m.Put("big", "x", time.Hour, 500)
 	if m.Len() != 0 {
 		t.Fatal("oversized entry should not be stored")
+	}
+}
+
+func TestMemoConcurrentAccess(t *testing.T) {
+	m := NewMemo(1 << 20)
+	const workers = 16
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				key := fmt.Sprintf("k%d", (id+j)%8)
+				m.Put(key, j, time.Minute, 16)
+				if v, ok := m.Get(key); ok && v.(int) < 0 {
+					t.Errorf("negative value cached: %v", v)
+					return
+				}
+				if j%100 == 0 {
+					m.Delete(key)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	if m.bytes > m.maxBytes {
+		t.Fatalf("cache exceeded byte bound after concurrent writes: %d > %d", m.bytes, m.maxBytes)
 	}
 }

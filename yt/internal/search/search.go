@@ -89,9 +89,12 @@ func NormalizeText(s string) string {
 	return strings.ToLower(searchReplacer.Replace(s))
 }
 
-// queryTerms splits a query into terms. A spelled-out acronym ("M C P") is
-// collapsed, because no caption contains those as three separate words and
-// matching each letter turns the query into noise.
+// queryTerms splits a query into terms and collapses spelled-out acronyms: a
+// contiguous run of single-letter tokens anywhere in the query ("m c p" inside
+// "m c p server") becomes the joined acronym, because no caption contains
+// those letters as separate words and matching each letter turns the query
+// into noise. A lone letter ("a server") and ordinary short words ("ai ml")
+// are left alone.
 func queryTerms(q string) []string {
 	var out []string
 	for _, t := range strings.Fields(NormalizeText(q)) {
@@ -100,27 +103,44 @@ func queryTerms(q string) []string {
 			out = append(out, t)
 		}
 	}
-	if len(out) >= 2 && allSingleRune(out) {
-		return []string{strings.Join(out, "")}
+	return collapseAcronymRuns(out)
+}
+
+// collapseAcronymRuns joins contiguous runs of two or more single-rune
+// tokens. Runs are found inside larger queries, not only when the whole query
+// is the acronym.
+func collapseAcronymRuns(terms []string) []string {
+	var out []string
+	for i := 0; i < len(terms); {
+		if runeLen(terms[i]) == 1 {
+			j := i + 1
+			for j < len(terms) && runeLen(terms[j]) == 1 {
+				j++
+			}
+			// Two single letters are too often ordinary prose ("a b") to
+			// collapse safely; three or more is the useful acronym shape.
+			if j-i >= 3 {
+				out = append(out, strings.Join(terms[i:j], ""))
+			} else {
+				out = append(out, terms[i:j]...)
+			}
+			i = j
+			continue
+		}
+		out = append(out, terms[i])
+		i++
 	}
 	return out
 }
 
-func allSingleRune(terms []string) bool {
-	for _, t := range terms {
-		if len([]rune(t)) != 1 {
-			return false
-		}
-	}
-	return true
-}
+func runeLen(s string) int { return len([]rune(s)) }
 
-// containsTerm matches a token. Tokens of one or two runes ("ai", "5") are
-// matched on word boundaries so they do not fire on every word containing
-// those letters; longer tokens keep substring matching for stems like
-// "evaluat" in "evaluation".
+// containsTerm matches a token. Tokens of three runes or fewer ("ai", "5",
+// "cat") are matched on word boundaries so they do not fire as substrings of
+// unrelated words ("cat" in "category"); longer tokens keep substring
+// matching for stems like "evaluat" in "evaluation".
 func containsTerm(haystack, term string) bool {
-	if len([]rune(term)) > 2 {
+	if runeLen(term) > 3 {
 		return strings.Contains(haystack, term)
 	}
 	h, t := []rune(haystack), []rune(term)
@@ -200,7 +220,13 @@ func Segments(segs []transcript.Segment, opts Options) Result {
 	mode := normalizeMatchMode(opts.MatchMode)
 	terms := queryTerms(opts.Query)
 	if len(terms) == 0 {
-		return Result{Matches: []Match{}, MatchMode: string(mode)}
+		return Result{
+			Matches:   []Match{},
+			MatchMode: string(mode),
+			Notes: []string{
+				"the query contains no searchable words (punctuation or whitespace only); retry with a text query",
+			},
+		}
 	}
 	if opts.MaxMatches <= 0 {
 		opts.MaxMatches = DefaultMaxMatches
@@ -354,6 +380,18 @@ func Segments(segs []transcript.Segment, opts Options) Result {
 	}
 
 	if len(res.Matches) == 0 {
+		// A silent empty page wastes a retry: say why the window produced
+		// nothing before explaining term-level absence.
+		switch {
+		case len(segs) > 0 && startCue >= len(segs):
+			res.Notes = append(res.Notes, fmt.Sprintf(
+				"start_cue=%d is past the end of the transcript (%d cues); retry with start_cue=0",
+				startCue, len(segs)))
+		case startCue > 0:
+			res.Notes = append(res.Notes, fmt.Sprintf(
+				"no matches from start_cue=%d onward; earlier cues were not searched - retry with start_cue=0",
+				startCue))
+		}
 		var missing []string
 		for _, s := range stats {
 			if s.Matches == 0 {

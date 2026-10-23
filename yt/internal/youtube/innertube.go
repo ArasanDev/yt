@@ -94,7 +94,12 @@ type playerResponse struct {
 		LengthSeconds    string `json:"lengthSeconds"`
 		ViewCount        string `json:"viewCount"`
 		ShortDescription string `json:"shortDescription"`
-		IsLiveContent    bool   `json:"isLiveContent"`
+		// IsLiveContent is historical: true for any video that was ever
+		// broadcast live, including finished streams. It must not be used as
+		// "is live now".
+		IsLiveContent bool `json:"isLiveContent"`
+		// IsLive is present on currently-live player responses.
+		IsLive bool `json:"isLive"`
 	} `json:"videoDetails"`
 	Captions struct {
 		Renderer struct {
@@ -110,6 +115,13 @@ type playerResponse struct {
 			UploadDate  string   `json:"uploadDate"`
 			Category    string   `json:"category"`
 			Keywords    []string `json:"keywords,omitempty"`
+			// LiveBroadcastDetails is present on live and recently-ended
+			// broadcasts; IsLiveNow is the current-liveness signal.
+			LiveBroadcastDetails struct {
+				IsLiveNow      bool   `json:"isLiveNow"`
+				StartTimestamp string `json:"startTimestamp"`
+				EndTimestamp   string `json:"endTimestamp"`
+			} `json:"liveBroadcastDetails"`
 		} `json:"playerMicroformatRenderer"`
 	} `json:"microformat"`
 }
@@ -122,8 +134,21 @@ func (p *playerResponse) playable() bool {
 	return p.PlayabilityStatus.Status == "OK"
 }
 
-func (p *playerResponse) isLive() bool {
-	return p.VideoDetails.IsLiveContent
+// isLiveNow reports whether the broadcast is live right now. It prefers the
+// explicit live signals; IsLiveContent is deliberately not consulted because
+// it stays true after a stream ends.
+func (p *playerResponse) isLiveNow() bool {
+	return p.Microformat.Renderer.LiveBroadcastDetails.IsLiveNow || p.VideoDetails.IsLive
+}
+
+// isLive is kept as the current-liveness accessor used by callers. Historical
+// liveness (ever live) is a separate question; see wasLive.
+func (p *playerResponse) isLive() bool { return p.isLiveNow() }
+
+// wasLive reports whether the video was ever a live broadcast. It is true for
+// finished streams, so it must not gate short TTLs or transcript caching.
+func (p *playerResponse) wasLive() bool {
+	return p.VideoDetails.IsLiveContent || p.isLiveNow()
 }
 
 func (p *playerResponse) durationSeconds() int {
@@ -220,7 +245,19 @@ func readBody(resp *http.Response, limit int64) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, apperr.ClassifyHTTPStatus(resp.StatusCode, resp.Header.Get("Retry-After"))
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, limit))
+	// Read one byte past the limit so a truncated body is reported as
+	// too-large instead of surfacing later as a confusing JSON/XML parse error.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		te := apperr.New(apperr.CodeNetwork, "could not read response body: %v", err)
+		te.Retryable = true
+		return nil, te
+	}
+	if int64(len(body)) > limit {
+		return nil, apperr.New(apperr.CodeUpstreamChanged,
+			"response too large: body exceeded the %d-byte limit", limit)
+	}
+	return body, nil
 }
 
 // ---- fetchers ----
@@ -334,6 +371,22 @@ func extractInitialPlayerResponse(page string) string {
 	return ""
 }
 
+// terminalPlayerError reports whether a player error is a verdict that trying
+// another client cannot change: the video's own status, or an IP-level block
+// (bot check / rate limit) that all clients share.
+func terminalPlayerError(err error) (*apperr.Error, bool) {
+	te, ok := apperr.As(err)
+	if !ok || te == nil {
+		return nil, false
+	}
+	switch te.Code {
+	case apperr.CodePrivate, apperr.CodeAgeRestricted, apperr.CodeBotCheck,
+		apperr.CodeNotFound, apperr.CodeRateLimited:
+		return te, true
+	}
+	return nil, false
+}
+
 // fetchPlayer cascades acquisition methods. A response whose caption track list
 // is empty is only used as a fallback: an OK response with zero tracks from one
 // client must not short-circuit clients that do have tracks.
@@ -345,11 +398,14 @@ func (c *Client) fetchPlayer(ctx context.Context, videoID string) (*playerRespon
 	for _, cc := range clientContexts {
 		pr, err := c.innertubePlayer(ctx, videoID, cc)
 		if err != nil {
-			if te, ok := apperr.As(err); ok {
-				switch te.Code {
-				case apperr.CodePrivate, apperr.CodeAgeRestricted, apperr.CodeBotCheck, apperr.CodeNotFound:
-					return nil, "", te
-				}
+			// A verdict on the video, or an IP-level block that every client
+			// would hit, ends the cascade immediately. In particular a 429
+			// must not burn the remaining clients' share of the deadline.
+			if te, ok := terminalPlayerError(err); ok {
+				return nil, "", te
+			}
+			if ce := apperr.ClassifyContext(ctx.Err()); ce != nil {
+				return nil, "", ce
 			}
 			errs = append(errs, err)
 			continue
@@ -365,11 +421,11 @@ func (c *Client) fetchPlayer(ctx context.Context, videoID string) (*playerRespon
 
 	pr, err := c.watchPagePlayer(ctx, videoID)
 	if err != nil {
-		if te, ok := apperr.As(err); ok {
-			switch te.Code {
-			case apperr.CodePrivate, apperr.CodeAgeRestricted, apperr.CodeBotCheck, apperr.CodeNotFound:
-				return nil, "", te
-			}
+		if te, ok := terminalPlayerError(err); ok {
+			return nil, "", te
+		}
+		if ce := apperr.ClassifyContext(ctx.Err()); ce != nil {
+			return nil, "", ce
 		}
 		errs = append(errs, err)
 	} else if len(pr.tracks()) > 0 {

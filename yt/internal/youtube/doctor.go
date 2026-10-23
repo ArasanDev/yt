@@ -37,6 +37,7 @@ func (c *Client) Doctor(ctx context.Context, probe string) DoctorReport {
 		entry := DoctorClient{Client: name, Version: version}
 		t0 := time.Now()
 		pr, err := fetch()
+		entry.MS = time.Since(t0).Milliseconds()
 		if err != nil {
 			if te, ok := apperr.As(err); ok {
 				entry.Code = te.Code
@@ -48,7 +49,6 @@ func (c *Client) Doctor(ctx context.Context, probe string) DoctorReport {
 			entry.OK = true
 			entry.Title = pr.VideoDetails.Title
 			entry.CaptionTracks = len(pr.tracks())
-			entry.MS = time.Since(t0).Milliseconds()
 			report.OKClients++
 		}
 		report.Results = append(report.Results, entry)
@@ -65,8 +65,31 @@ func (c *Client) Doctor(ctx context.Context, probe string) DoctorReport {
 	})
 
 	report.TotalMS = time.Since(start).Milliseconds()
-	if report.OKClients == 0 {
-		report.Verdict = "all_clients_failed"
-	}
+	report.Verdict = doctorVerdict(report.Results)
 	return report
+}
+
+// doctorVerdict distinguishes "the API parsed" from "the API can actually
+// provide captions". A client that returns a playable response with zero
+// caption tracks is not healthy for a transcript tool.
+func doctorVerdict(results []DoctorClient) string {
+	ok := false
+	captions := false
+	for _, r := range results {
+		if !r.OK {
+			continue
+		}
+		ok = true
+		if r.CaptionTracks > 0 {
+			captions = true
+		}
+	}
+	switch {
+	case !ok:
+		return "all_clients_failed"
+	case !captions:
+		return "no_captions"
+	default:
+		return "healthy"
+	}
 }

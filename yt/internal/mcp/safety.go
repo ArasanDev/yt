@@ -50,3 +50,19 @@ func segmentsText(segs []transcript.Segment) string {
 	}
 	return b.String()
 }
+
+// matchesText joins match text with its before/after context so the
+// instruction-text detector sees what the agent will actually read, not just
+// the matching cue.
+func matchesText(matches []search.Match) string {
+	var b strings.Builder
+	for _, m := range matches {
+		b.WriteString(m.Before)
+		b.WriteByte(' ')
+		b.WriteString(m.Text)
+		b.WriteByte(' ')
+		b.WriteString(m.After)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}

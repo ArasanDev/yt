@@ -1,8 +1,13 @@
 // Package mcp exposes the yt tools over stdio via the official Go SDK.
 //
 // Design notes for agents:
-//   - The transcript body appears exactly once (in textContent). Structured
-//     content carries metadata only.
+//   - The transcript body deliberately appears twice: once in textContent (for
+//     clients that read content blocks) and again in structuredContent
+//     (structuredContent.text for format=text, structuredContent.segments for
+//     format=json). Both copies are identical; returned_chars reports the body
+//     size in runes, so a client can sanity-check the copy it received. A
+//     client that silently receives no transcript is worse than a duplicated
+//     payload.
 //   - Truncation is reported in the header line AND in structured metadata, not
 //     in a trailing footer that a client would cut off.
 //   - Regions are addressed with start_seconds/end_seconds and start_cue/max_cues,
@@ -24,6 +29,7 @@ import (
 	"yt/internal/render"
 	"yt/internal/search"
 	"yt/internal/transcript"
+	"yt/internal/version"
 	"yt/internal/youtube"
 )
 
@@ -60,7 +66,7 @@ func readOnlyAnnotations(title string, idempotent bool) *mcpsdk.ToolAnnotations 
 
 type videoInfoIn struct {
 	URLOrID          string `json:"url_or_id" jsonschema:"YouTube URL (watch, youtu.be, shorts, live, embed) or a bare 11-character video ID"`
-	DescriptionChars *int   `json:"description_chars,omitempty" jsonschema:"characters of description to return; omitted = 500, 0 = full"`
+	DescriptionChars *int   `json:"description_chars,omitempty" jsonschema:"characters of description to return; omitted = 500, 0 = full. Negative values are rejected."`
 }
 
 type transcriptIn struct {
@@ -69,8 +75,8 @@ type transcriptIn struct {
 	AllowTranslation *bool   `json:"allow_translation,omitempty" jsonschema:"when the requested language is missing, machine-translate another track (default true). Set false to receive a no_matching_language error instead."`
 	Format           string  `json:"format,omitempty" jsonschema:"'text' (default) or 'json' (cue-level segments with start/duration)"`
 	Granularity      string  `json:"granularity,omitempty" jsonschema:"'cue' (one line per caption cue) or 'block' (default, merges about 30 seconds of speech per line). Ignored for format=json."`
-	TimestampMode    string  `json:"timestamp_mode,omitempty" jsonschema:"'none', 'block' (default, a [MM:SS] stamp roughly every 30s) or 'cue' (every line)"`
-	Timestamps       bool    `json:"timestamps,omitempty" jsonschema:"legacy alias: true forces timestamp_mode='cue'"`
+	TimestampMode    string  `json:"timestamp_mode,omitempty" jsonschema:"'none', 'block' (default, a [MM:SS] stamp roughly every 30s) or 'cue' (every line). Wins over timestamps=true."`
+	Timestamps       bool    `json:"timestamps,omitempty" jsonschema:"legacy alias: when timestamp_mode is omitted, true forces timestamp_mode='cue'. An explicit timestamp_mode always wins."`
 	StartSeconds     float64 `json:"start_seconds,omitempty" jsonschema:"start of the range in seconds; 0 = beginning"`
 	EndSeconds       float64 `json:"end_seconds,omitempty" jsonschema:"end of the range in seconds; 0 = end"`
 	StartCue         int     `json:"start_cue,omitempty" jsonschema:"first cue index to return (0-based)"`
@@ -81,8 +87,8 @@ type transcriptIn struct {
 type searchIn struct {
 	URLOrID          string `json:"url_or_id" jsonschema:"YouTube URL (watch, youtu.be, shorts, live, embed) or a bare 11-character video ID"`
 	Query            string `json:"query" jsonschema:"text to find (case-insensitive). A spelled-out acronym like 'M C P' is collapsed to 'mcp'."`
-	ContextCues      *int   `json:"context_cues,omitempty" jsonschema:"cues of context before and after each match; omitted = 1, 0 = none, max 10"`
-	MaxMatches       int    `json:"max_matches,omitempty" jsonschema:"maximum matches to return; 0 = default 10, max 50"`
+	ContextCues      *int   `json:"context_cues,omitempty" jsonschema:"cues of context before and after each match; omitted = 1, 0 = none, max 10. Negative values are clamped to 0 and noted; values above 10 are clamped to 10 and noted."`
+	MaxMatches       int    `json:"max_matches,omitempty" jsonschema:"maximum matches to return; 0 = default 10, max 50. Negative values are clamped to the default and noted; values above 50 are clamped to 50 and noted."`
 	StartCue         int    `json:"start_cue,omitempty" jsonschema:"skip matches before this cue index; pass a previous next_cue to continue past truncation"`
 	MatchMode        string `json:"match_mode,omitempty" jsonschema:"how multi-word queries match: 'all' (every term within 3 cues, default), 'any' (at least one term), or 'phrase' (adjacent words, in order)"`
 	Languages        string `json:"languages,omitempty" jsonschema:"comma-separated ISO codes; 'original' for the video's own track. Default 'en'."`
@@ -160,7 +166,26 @@ type searchOut struct {
 	NextCue           *int              `json:"next_cue,omitempty"`
 	Terms             []search.TermStat `json:"terms,omitempty"`
 	Notes             []string          `json:"notes,omitempty"`
+	Warnings          []string          `json:"warnings,omitempty"`
 	Matches           []search.Match    `json:"matches"`
+}
+
+// videoInfoOut adds the trust label at the MCP layer: youtube.VideoInfo is
+// shared with the CLI and must not grow MCP-only fields. Warnings flag
+// instruction-shaped text in the title/description, which the agent is about
+// to read as data.
+type videoInfoOut struct {
+	*youtube.VideoInfo
+	ContentTrust string   `json:"content_trust"`
+	Warnings     []string `json:"warnings,omitempty"`
+}
+
+// channelListingOut mirrors videoInfoOut for list_channel_videos: the trust
+// label plus advisory warnings over titles and description excerpts.
+type channelListingOut struct {
+	*youtube.ChannelListing
+	ContentTrust string   `json:"content_trust"`
+	Warnings     []string `json:"warnings,omitempty"`
 }
 
 type trackInfo struct {
@@ -181,6 +206,10 @@ type tracksOut struct {
 }
 
 // ---- result helpers ----
+
+// maxContextCues mirrors search's unexported context-cue cap so the handler
+// can clamp (and report the clamp) before the core does it silently.
+const maxContextCues = 10
 
 func okResult(v any, text string) *mcpsdk.CallToolResult {
 	return &mcpsdk.CallToolResult{
@@ -257,13 +286,23 @@ func (s *Server) getVideoInfo(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 	descChars := youtube.DefaultDescriptionChars
 	if in.DescriptionChars != nil {
+		if *in.DescriptionChars < 0 {
+			te := apperr.New(apperr.CodeBadRequest, "description_chars must be 0 or greater.")
+			te.Suggestion = "Omit description_chars for the default 500, or pass 0 for the full description."
+			return errorResult(te), nil, nil
+		}
 		descChars = *in.DescriptionChars
 	}
 	info, err := s.client.Info(ctx, id, descChars)
 	if err != nil {
 		return errorResult(err), nil, nil
 	}
-	return okResult(info, compactJSON(info)), nil, nil
+	out := videoInfoOut{
+		VideoInfo:    info,
+		ContentTrust: "untrusted",
+		Warnings:     detectInstructionText(info.Title + "\n" + info.Description),
+	}
+	return okResult(out, compactJSON(out)), nil, nil
 }
 
 // listChannelVideos is discovery, not depth: it returns exact publish
@@ -304,7 +343,19 @@ func (s *Server) listChannelVideos(ctx context.Context, _ *mcpsdk.CallToolReques
 	if err != nil {
 		return errorResult(err), nil, nil
 	}
-	return okResult(listing, compactJSON(listing)), nil, nil
+	var flagged strings.Builder
+	for _, v := range listing.Videos {
+		flagged.WriteString(v.Title)
+		flagged.WriteByte('\n')
+		flagged.WriteString(v.Summary)
+		flagged.WriteByte('\n')
+	}
+	out := channelListingOut{
+		ChannelListing: listing,
+		ContentTrust:   "untrusted",
+		Warnings:       detectInstructionText(flagged.String()),
+	}
+	return okResult(out, compactJSON(out)), nil, nil
 }
 
 func (s *Server) getTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest, in transcriptIn) (*mcpsdk.CallToolResult, any, error) {
@@ -372,6 +423,12 @@ func (s *Server) getTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 		meta.NextCueIndex = js.NextCueIndex
 		meta.Warnings = detectInstructionText(segmentsText(js.Segments))
 		meta.Notes = []string{"format=json always returns cue-level segments; granularity and timestamp_mode are ignored."}
+		// Shape note: the textContent groups metadata under "meta" so a
+		// text-only reader sees the boundary between metadata and payload,
+		// while structuredContent is flat (meta fields inline plus segments)
+		// because clients decode it against a flat schema. The two shapes are
+		// deliberately different; unifying them would break one audience or
+		// the other.
 		type jsonDoc struct {
 			Meta     transcriptMeta       `json:"meta"`
 			Segments []transcript.Segment `json:"segments"`
@@ -388,8 +445,16 @@ func (s *Server) getTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 	meta.ReturnedWords = r.ReturnedWords
 	meta.Granularity = r.Granularity
 	meta.TimestampMode = r.TimestampMode
-	if r.Granularity == "block" {
+	// The window follows the timestamp mode, not the granularity: a
+	// block-mode stamp stands for a merged ~30s span of speech, while
+	// cue-mode stamps are the exact line start and none has no timestamps
+	// at all. granularity=cue with timestamp_mode=block still stamps only
+	// every ~30s, so its window is 30 too.
+	switch r.TimestampMode {
+	case "block":
 		meta.TimestampWindowSeconds = int(render.BlockSeconds)
+	default: // "cue", "none"
+		meta.TimestampWindowSeconds = 0
 	}
 	meta.Coverage = r.Coverage
 	meta.Truncated = r.Truncated
@@ -397,8 +462,23 @@ func (s *Server) getTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 	meta.NextCueIndex = r.NextCueIndex
 	meta.Notes = r.Notes
 	meta.Warnings = detectInstructionText(r.Text)
-	out := transcriptOut{transcriptMeta: meta, Text: r.Text}
-	return okResult(out, r.Text), nil, nil
+	// Renderer notes (unknown granularity/timestamp mode, sentence->block
+	// fallback, empty range) live only in structured metadata; a text-only
+	// client must still see why the output degraded, so they are echoed
+	// into the body as compact "# note:" lines. The structured body copy
+	// stays byte-identical to the textContent copy by construction.
+	text := r.Text
+	if len(r.Notes) > 0 {
+		var b strings.Builder
+		b.WriteString(text)
+		for _, n := range r.Notes {
+			b.WriteString("\n# note: ")
+			b.WriteString(n)
+		}
+		text = b.String()
+	}
+	out := transcriptOut{transcriptMeta: meta, Text: text}
+	return okResult(out, text), nil, nil
 }
 
 func (s *Server) searchTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest, in searchIn) (*mcpsdk.CallToolResult, any, error) {
@@ -411,15 +491,41 @@ func (s *Server) searchTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest
 		te.Suggestion = "Pass the words you are looking for, e.g. query=\"domain driven design\"."
 		return errorResult(te), nil, nil
 	}
+	if in.StartCue < 0 {
+		te := apperr.New(apperr.CodeBadRequest, "start_cue must be 0 or greater.")
+		te.Suggestion = "Omit start_cue to search from the beginning, or pass a non-negative cue index."
+		return errorResult(te), nil, nil
+	}
 	mode, ok := search.ParseMode(in.MatchMode)
 	if !ok {
 		te := apperr.New(apperr.CodeBadRequest, "unknown match_mode %q", in.MatchMode)
 		te.Suggestion = "Use match_mode=all (default), any, or phrase."
 		return errorResult(te), nil, nil
 	}
+	// Clamp out-of-range values at the boundary and say so: the search core
+	// clamps silently, and a client that asked for 100 context cues should
+	// learn it got 10 rather than discover it by counting.
 	ctxCues := search.DefaultContextCues
+	var clampNotes []string
 	if in.ContextCues != nil {
 		ctxCues = *in.ContextCues
+		if ctxCues < 0 {
+			ctxCues = 0
+			clampNotes = append(clampNotes, "context_cues was negative; clamped to 0.")
+		}
+		if ctxCues > maxContextCues {
+			ctxCues = maxContextCues
+			clampNotes = append(clampNotes, fmt.Sprintf("context_cues above %d; clamped to %d.", maxContextCues, maxContextCues))
+		}
+	}
+	maxMatches := in.MaxMatches
+	if maxMatches < 0 {
+		maxMatches = 0 // the core treats 0 as the default
+		clampNotes = append(clampNotes, "max_matches was negative; clamped to 0 (the default).")
+	}
+	if maxMatches > search.MaxMatchesLimit {
+		maxMatches = search.MaxMatchesLimit
+		clampNotes = append(clampNotes, fmt.Sprintf("max_matches above %d; clamped to %d.", search.MaxMatchesLimit, search.MaxMatchesLimit))
 	}
 	t, err := s.client.Transcript(ctx, id, s.transcriptOptions(in.Languages, in.AllowTranslation))
 	if err != nil {
@@ -428,7 +534,7 @@ func (s *Server) searchTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest
 	res := search.Segments(t.Segments, search.Options{
 		Query:       in.Query,
 		ContextCues: ctxCues,
-		MaxMatches:  in.MaxMatches,
+		MaxMatches:  maxMatches,
 		StartCue:    in.StartCue,
 		MatchMode:   mode,
 	})
@@ -448,7 +554,8 @@ func (s *Server) searchTranscript(ctx context.Context, _ *mcpsdk.CallToolRequest
 		StartCue:          in.StartCue,
 		NextCue:           res.NextCue,
 		Terms:             res.Terms,
-		Notes:             res.Notes,
+		Notes:             append(clampNotes, res.Notes...),
+		Warnings:          detectInstructionText(matchesText(res.Matches)),
 		Matches:           res.Matches,
 	}
 	return okResult(out, compactJSON(out)), nil, nil
@@ -516,7 +623,7 @@ func structuredSchemaErrors(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
 // Run serves the yt tools over stdio until the client disconnects.
 func Run(client *youtube.Client) error {
 	s := NewServer(client)
-	server := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "yt", Version: "v0.2.1"},
+	server := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "yt", Version: version.Version},
 		&mcpsdk.ServerOptions{Instructions: serverInstructions})
 	server.AddReceivingMiddleware(structuredSchemaErrors)
 
