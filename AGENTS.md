@@ -163,7 +163,7 @@ with direct fetches, and do not cache mutable values that callers may modify.
 
 - `make build` stamps version/commit/date via `-ldflags`.
 - `.goreleaser.yaml` builds linux/darwin/windows on amd64/arm64, archives,
-  checksums, and the Homebrew cask.
+  Linux deb/rpm/apk packages, checksums, and the Homebrew cask.
 - `.github/workflows/release.yml` runs on `v*` tags: GitHub Release, GHCR image,
   and MCP registry metadata. Homebrew is skipped unless
   `HOMEBREW_TAP_GITHUB_TOKEN` is set.

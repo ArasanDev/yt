@@ -48,6 +48,23 @@ checksum:
   name_template: checksums.txt
   algorithm: sha256
 
+nfpms:
+  - id: linux-packages
+    package_name: yt
+    vendor: ArasanDev
+    homepage: https://github.com/ArasanDev/yt
+    maintainer: Tamilarasan <aiwithtamil14@gmail.com>
+    description: YouTube transcripts, search, and channel monitoring for agents and humans
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/yt/LICENSE
+
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
 

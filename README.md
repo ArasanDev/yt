@@ -101,13 +101,25 @@ docker run --rm ghcr.io/arasandev/yt:latest transcript dQw4w9WgXcQ
 The image is a distroless static build. With no TTY, bare `yt` already serves
 MCP, so the default container command is `mcp`.
 
+### Linux packages
+
+Release assets include `.deb`, `.rpm`, and `.apk` packages for `amd64` and
+`arm64`:
+
+```sh
+sudo dpkg -i yt_<version>_linux_amd64.deb
+sudo rpm -i yt_<version>_linux_amd64.rpm
+sudo apk add --allow-untrusted yt_<version>_linux_amd64.apk
+```
+
 ### Prebuilt binaries
 
-Every release publishes archives and a `checksums.txt`:
+Every release publishes archives, Linux packages, and a `checksums.txt`:
 
 <https://github.com/ArasanDev/yt/releases>
 
-Targets: `darwin`/`linux`/`windows` on `amd64` and `arm64`.
+Targets: `darwin`/`linux`/`windows` on `amd64` and `arm64`; Linux also ships
+`deb`/`rpm`/`apk` packages.
 
 ### From source
 
@@ -226,7 +238,8 @@ or raw `mcpServers` JSON (Devin, Claude Desktop, Cursor, Windsurf, …):
 
 A `v*` tag triggers `.github/workflows/release.yml`, which:
 
-1. runs the test suite and GoReleaser (archives, checksums, GitHub Release);
+1. runs the test suite and GoReleaser (archives, Linux packages, checksums,
+   GitHub Release);
 2. builds and pushes a multi-arch `ghcr.io/arasandev/yt` image;
 3. stamps the version into `server.json` and publishes to the MCP registry.
 
