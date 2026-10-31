@@ -1,0 +1,88 @@
+version: 2
+
+project_name: yt
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: yt
+    main: ./cmd/yt
+    binary: yt
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/ArasanDev/yt/internal/version.Version={{ .Version }}
+      - -X github.com/ArasanDev/yt/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/ArasanDev/yt/internal/version.Date={{ .CommitDate }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+homebrew_casks:
+  - name: yt
+    binaries:
+      - yt
+    repository:
+      owner: ArasanDev
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/ArasanDev/yt
+    description: YouTube transcripts, search, and channel monitoring for agents and humans
+    caveats: |
+      Run `yt --help` to get started, or wire it into an agent:
+        devin mcp add yt -- yt mcp
+        claude mcp add yt -- yt mcp
+
+release:
+  github:
+    owner: ArasanDev
+    name: yt
+  draft: false
+  prerelease: auto
+  footer: |
+    **Full changelog**: https://github.com/ArasanDev/yt/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+    Install with `curl -fsSL https://raw.githubusercontent.com/ArasanDev/yt/main/install.sh | sh`
+    or `go install github.com/ArasanDev/yt/cmd/yt@{{ .Tag }}`.

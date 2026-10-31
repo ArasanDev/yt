@@ -1,0 +1,8 @@
+.git
+.github
+.devin
+bin
+dist
+*.md
+LICENSE
+install.sh
