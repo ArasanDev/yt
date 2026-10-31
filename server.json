@@ -7,7 +7,8 @@
   "websiteUrl": "https://github.com/ArasanDev/yt",
   "repository": {
     "url": "https://github.com/ArasanDev/yt",
-    "source": "github"
+    "source": "github",
+    "id": "1440459184"
   },
   "packages": [
     {
