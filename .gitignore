@@ -1,0 +1,18 @@
+# Build output
+/bin/
+/dist/
+/yt
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*
