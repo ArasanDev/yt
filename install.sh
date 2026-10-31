@@ -74,9 +74,20 @@ case "$(uname -m)" in
 	*) fail "unsupported architecture: $(uname -m)" ;;
 esac
 
+latest_tag() {
+	if [ "$DOWNLOADER" = curl ]; then
+		# Follow the /releases/latest redirect instead of spending an
+		# unauthenticated GitHub API request.
+		curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" |
+			sed 's#.*/tag/##'
+	else
+		download_stdout "https://api.github.com/repos/$REPO/releases/latest" |
+			sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+	fi
+}
+
 if [ "$VERSION" = "latest" ]; then
-	VERSION="$(download_stdout "https://api.github.com/repos/$REPO/releases/latest" |
-		sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+	VERSION="$(latest_tag)"
 	[ -n "$VERSION" ] || fail "could not determine the latest release; set YT_VERSION"
 fi
 
